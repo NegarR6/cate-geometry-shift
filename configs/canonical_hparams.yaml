@@ -1,0 +1,83 @@
+# Locked hyper-parameters for paper tables (ICLR characterization)
+# Source of truth for run_*_canonical scripts. Do not change without re-locking results.
+#
+# Protocol note (HPO fairness):
+#   - RIPO / FT-TARNet: values below come from prior Optuna on IHDP (see tune_optuna_ripo).
+#   - DragonNet / CFR / TransTEE: fixed literature-scale defaults under SAME epoch/patience
+#     budget as residual models. Full joint Optuna for all 5 models is optional follow-up
+#     (see src/tune_symmetric_hpo.py). Until that runs, paper must state "fixed-HP protocol
+#     with matched epoch budget; RIPO/FT pre-tuned on IHDP only."
+
+protocol:
+  epochs_ihdp: 100
+  patience_ihdp: 20
+  epochs_acic: 80
+  patience_acic: 15
+  inner_val_fraction: 0.2
+  ipm_type: mean_diff   # locked tables; NOT Wasserstein
+  seed_policy: paired   # same seed per model on same data split
+
+ripo_no_tree: &ripo
+  d_token: 32
+  num_layers: 3
+  nhead: 8
+  dim_feedforward: 64
+  dropout: 0.23437484700462335
+  lr: 0.00033292663683309287
+  weight_decay: 9.462175356461487e-06
+  ipm_weight: 0.194338644844741
+  batch_size: 32
+  head_hidden_dim: 128
+  residual_alpha: 0.2628094190643375
+  tree_signal_dim: 4
+
+ripo_main:
+  <<: *ripo
+
+ft_tarnet:
+  d_token: 64
+  num_layers: 3
+  nhead: 4
+  dim_feedforward: 256
+  dropout: 0.20284285513135544
+  lr: 0.0006476948799619625
+  weight_decay: 7.633686924354316e-05
+  ipm_weight: 0.29437705645807866
+  batch_size: 32
+  head_hidden_dim: 64
+
+dragonnet:
+  hidden_dims: [200, 200, 200]
+  head_hidden: 100
+  dropout: 0.1
+  lr: 0.001
+  weight_decay: 0.0001
+  alpha_prop: 1.0
+  batch_size: 64
+
+cfr:
+  hidden_dims: [200, 200, 200]
+  head_hidden: 100
+  dropout: 0.1
+  lr: 0.001
+  weight_decay: 0.0001
+  ipm_weight: 0.5
+  batch_size: 64
+
+transtee:
+  d_emb: 16
+  n_layers: 1
+  nhead: 2
+  dropout: 0.1
+  lr: 0.0005
+  weight_decay: 0.0001
+  batch_size: 128
+
+# Shared Optuna search space for optional symmetric re-tune (same n_trials each)
+symmetric_search:
+  n_trials: 30
+  n_folds: 3
+  epochs_per_trial: 40
+  patience_per_trial: 10
+  metric: val_factual_mse   # never PEHE on test during HPO
+  models: [ripo_no_tree, ft_tarnet, dragonnet, cfr, transtee]

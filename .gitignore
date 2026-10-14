@@ -1,0 +1,22 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Large raw datasets (downloaded via scripts/download_data.py)
+data/*.npz
+data/*.csv
+data/*.tar.gz
+!data/README.md
+
+# Experiment logs & temporary artifacts
+wandb/
+*.log
+*.tmp
+.DS_Store

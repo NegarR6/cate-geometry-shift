@@ -1,0 +1,52 @@
+# Hyper-parameters for Geometry-Adaptive CATE (Method 1)
+# Defaults are deliberately aligned with locked ripo_no_tree capacity
+# so that comparisons remain fair under the paper protocol.
+
+protocol:
+  epochs: 80
+  patience: 15
+  inner_val_fraction: 0.2
+  ipm_type: mean_diff
+  seed_policy: paired
+  batch_size: 64
+
+model:
+  # Neural expert (matches canonical ripo_no_tree)
+  d_token: 32
+  num_layers: 3
+  nhead: 8
+  dim_feedforward: 64
+  dropout: 0.23
+  head_hidden_dim: 128
+
+  # Tree-biased expert (slightly lighter on purpose)
+  tree_d_token: 32
+  tree_layers: 2
+  tree_nhead: 4
+  tree_ff: 64
+  tree_dropout: 0.15
+  tree_head_dim: 64
+  tree_signal_dim: 4
+
+  # Router
+  router_hidden: 64
+  router_dropout: 0.1
+  router_temperature: 1.0
+  soft_mixture: true
+  extra_feature_dim: 0
+
+training:
+  lr: 0.00033
+  weight_decay: 1.0e-5
+  ipm_weight: 0.19
+  route_weight: 0.5          # set 0.0 for purely unsupervised routing
+  entropy_weight: 0.01
+  grad_clip: 1.0
+  use_oracle_route_synthetic: true   # only when τ is known
+
+ablations:
+  - soft_vs_hard_routing
+  - with_vs_without_oracle_route
+  - neural_only / tree_only / average / adaptive
+  - router_feature_versions (V0/V1/V2)
+  - geometry_shift (train A+B → test C, etc.)

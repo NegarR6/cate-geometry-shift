@@ -1,0 +1,2 @@
+n_rows,settings,threshold,accuracy,frac_true_neural,frac_true_tree,majority_baseline,beats_majority,beats_random,go_acc_ge_0.70,go_beats_majority
+18,"[1, 2, 3, 4, 5, 8]",-0.33,0.6111111111111112,0.2222222222222222,0.7777777777777778,0.7777777777777778,False,True,False,False
