@@ -1,8 +1,8 @@
-# Geometry-Dependent Rankings of CATE Estimators and the Information Cost of Performance Recovery under Pure Effect-Surface Shift
+# Geometry-Dependent Rankings of CATE Estimators and the Supervision Cost of Adaptation under Pure Effect-Surface Shift
 
 Official reproducibility repository for the manuscript:
 
-> **Geometry-Dependent Rankings of CATE Estimators and the Information Cost of Performance Recovery under Pure Effect-Surface Shift**  
+> **Geometry-Dependent Rankings of CATE Estimators and the Supervision Cost of Adaptation under Pure Effect-Surface Shift**  
 > Negar Rezaei and Ehsan Moeini  
 > School of Mathematics & Computer Science, Iran University of Science and Technology, Tehran, Iran
 
