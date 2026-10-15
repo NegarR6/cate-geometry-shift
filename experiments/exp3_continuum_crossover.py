@@ -1,5 +1,5 @@
 """
-Attack Plan α — Geometry continuum with REAL NeuralExpert + TreeExpert.
+Geometry continuum with REAL NeuralExpert + TreeExpert.
 
 For each λ in continuum A→B (or A→C):
   Stage1 pretrain experts independently on τ_λ data
@@ -170,7 +170,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pair", type=str, default="A-B")
     ap.add_argument("--lambdas", type=str, default="")
-    ap.add_argument("--n_seeds", type=int, default=3)
+    ap.add_argument("--n_seeds", type=int, default=10)
     ap.add_argument("--n", type=int, default=3000)
     ap.add_argument("--p", type=int, default=12)
     ap.add_argument("--signal", type=float, default=1.0)

@@ -159,7 +159,7 @@ class DoubleMLIRMBaseline(BaseCATEModel):
     """
     DoubleML Interactive Regression Model (IRM).
 
-    IMPORTANT (ICLR honesty):
+    IMPORTANT (protocol honesty):
       Standard DoubleML IRM targets ATE. Individual CATE is not reliably
       available in all doubleml versions. When cate() is missing this class
       returns a constant ATE prediction → Correlation will be 0.

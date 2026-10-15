@@ -1,23 +1,18 @@
-"""Semi-synthetic geometry shift adaptation ladder on IHDP-X (Table 6 and Fig. 3 Right).
+"""Semi-synthetic geometry shift ladder on IHDP-X (Table 6 / Fig 3 right).
 
-Trains GeometryAdaptiveCATE on the smooth effect surface world and evaluates adaptation
-on the threshold effect surface world sharing the same real IHDP covariates.
-Tree signals are fitted strictly on source data (no target outcome leakage).
-
-Usage:
-    python experiments/exp6_ihdp_x_ladder.py --reps 1-5 --ms 10,20,50,100 --device cuda
+P0 FIXES:
+- DR computed only on adaptation pool.
+- Fixed n_updates for adaptation (independent of m).
+- Report zero / constant baselines alongside frozen.
+- Source-only tree signals (never re-fit on target).
+- Estimated propensity from tree signals when available.
 """
 from __future__ import annotations
-import zlib
-import sys as _sys, pathlib as _pl
-_ROOT = _pl.Path(__file__).resolve().parent.parent
-if str(_ROOT) not in _sys.path: _sys.path.insert(0, str(_ROOT))
-if str(_ROOT / 'src') not in _sys.path: _sys.path.insert(0, str(_ROOT / 'src'))
-
 
 import argparse
 import os
 import sys
+import zlib
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -32,6 +27,8 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT))
 
 from adapt_geometry_shift import adapt_fewshot
+from budgeted_ladder_utils import dr_pseudo_tau as dr_pseudo_tau_util
+from budgeted_ladder_utils import source_ate_estimate
 from models_geometry_adaptive import build_geo_adaptive_from_hparams
 from semi_synthetic_geometry import make_geometry_pair_from_real
 from train_geometry_adaptive import GeometryAdaptiveTrainer, build_loaders, set_seed
@@ -41,26 +38,6 @@ from tree_signals import CrossFittedTreeSignals
 def pehe(a: np.ndarray, b: np.ndarray) -> float:
     a, b = np.asarray(a).ravel(), np.asarray(b).ravel()
     return float(np.sqrt(np.mean((a - b) ** 2)))
-
-
-def dr_pseudo_tau(X: np.ndarray, T: np.ndarray, Y: np.ndarray, n_splits: int = 3, seed: int = 0) -> np.ndarray:
-    X = np.asarray(X, float)
-    T = np.asarray(T).ravel().astype(int)
-    Y = np.asarray(Y, float)
-    n = len(Y)
-    e = np.zeros(n)
-    mu0 = np.zeros(n)
-    mu1 = np.zeros(n)
-    for tr, te in KFold(n_splits, shuffle=True, random_state=seed).split(X):
-        clf = LogisticRegression(max_iter=500).fit(X[tr], T[tr])
-        e[te] = np.clip(clf.predict_proba(X[te])[:, 1], 0.05, 0.95)
-        tr0, tr1 = tr[T[tr] == 0], tr[T[tr] == 1]
-        if len(tr0) < 5 or len(tr1) < 5:
-            continue
-        mu0[te] = Ridge(1.0).fit(X[tr0], Y[tr0]).predict(X[te])
-        mu1[te] = Ridge(1.0).fit(X[tr1], Y[tr1]).predict(X[te])
-    tau = (mu1 - mu0) + (T / e) * (Y - mu1) - ((1 - T) / (1 - e)) * (Y - mu0)
-    return np.nan_to_num(tau).astype(np.float32)
 
 
 def load_ihdp_rep(rep: int, data_dir: Path) -> Dict[str, np.ndarray]:
@@ -95,24 +72,17 @@ def split_idx(n: int, seed: int, val_frac: float = 0.1, test_frac: float = 0.2) 
 
 
 def train_on_source_world(
-    X: np.ndarray,
-    T: np.ndarray,
-    Y: np.ndarray,
-    e: np.ndarray,
-    tau: np.ndarray,
-    train_idx: np.ndarray,
-    val_idx: np.ndarray,
-    device: str,
-    pretrain_epochs: int,
-    joint_epochs: int,
-    seed: int,
-    verbose: bool,
+    X, T, Y, e, tau, train_idx, val_idx, device, pretrain_epochs, joint_epochs, seed, verbose,
 ):
     n, p = X.shape
     tb = CrossFittedTreeSignals(n_splits=3, seed=seed)
     ts = np.zeros((n, 4), np.float32)
     ts[train_idx] = tb.fit_transform(X[train_idx], T[train_idx], Y[train_idx])
     ts[val_idx] = tb.transform(X[val_idx])
+
+    e_hat = ts[:, 3].copy()
+    assert (e_hat[train_idx] > 0).all() and (e_hat[val_idx] > 0).all(), "propensity not filled"
+
     model = build_geo_adaptive_from_hparams(num_features=p)
     trainer = GeometryAdaptiveTrainer(
         model,
@@ -123,37 +93,38 @@ def train_on_source_world(
         route_weight_start=0.15,
         route_weight_end=0.45,
     )
-    tr_loader, va_loader = build_loaders(X, T, Y, e, ts, None, train_idx, val_idx)
+    tr_loader, va_loader = build_loaders(X, T, Y, e_hat, ts, None, train_idx, val_idx)
     trainer.pretrain_experts(tr_loader, va_loader, verbose=verbose)
     if joint_epochs > 0 and hasattr(trainer, "fit_joint_only"):
-        pred = trainer.predict_experts(X[train_idx], e[train_idx], ts[train_idx])
+        pred = trainer.predict_experts(X[train_idx], e_hat[train_idx], ts[train_idx])
         tn, tt = pred[1], pred[2]
         oracle = np.full(n, -1, np.int64)
-        oracle[train_idx] = (np.abs(tt - tau[train_idx]) < np.abs(tn - tau[train_idx])).astype(np.int64)
-        tr_loader, va_loader = build_loaders(X, T, Y, e, ts, oracle, train_idx, val_idx)
+        oracle[train_idx] = (
+            np.abs(tt - tau[train_idx]) < np.abs(tn - tau[train_idx])
+        ).astype(np.int64)
+        tr_loader, va_loader = build_loaders(X, T, Y, e_hat, ts, oracle, train_idx, val_idx)
         trainer.fit_joint_only(tr_loader, va_loader, verbose=verbose)
     return trainer, tb
 
 
-def predict_tau(trainer: GeometryAdaptiveTrainer, X: np.ndarray, e: np.ndarray, ts: np.ndarray, idx: np.ndarray) -> np.ndarray:
+def predict_tau(trainer, X, e, ts, idx):
     pred = trainer.predict_experts(X[idx], e[idx], ts[idx])
     return pred[0]
 
 
 def deterministic_sup_offset(sup: str, mod: int = 89) -> int:
-    """Deterministic cross-platform integer offset replacing Python's salted hash()."""
     return int(zlib.crc32(sup.encode("utf-8")) & 0xFFFFFFFF) % mod
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_dir", default="data")
-    ap.add_argument("--reps", default="1-5")
+    ap.add_argument("--reps", default="1-10")
     ap.add_argument("--ms", default="10,20,50,100")
     ap.add_argument("--supervisions", default="factual,dr_pseudo,oracle_tau")
     ap.add_argument("--pretrain_epochs", type=int, default=25)
     ap.add_argument("--joint_epochs", type=int, default=30)
-    ap.add_argument("--adapt_steps", type=int, default=100)
+    ap.add_argument("--n_updates", type=int, default=200)
     ap.add_argument("--noise_std", type=float, default=0.4)
     ap.add_argument("--signal_scale", type=float, default=2.5)
     ap.add_argument("--level_gap", type=float, default=3.0)
@@ -209,16 +180,37 @@ def main() -> None:
         test_idx = perm[n_cal : n_cal + n_te]
         pool = perm[n_cal + n_te :]
 
-        # Strict source-only tree signal transform (no target outcome leakage)
+        # Strict source-only tree signal transform
         ts_t = tb.transform(Xt)
-        tau_f_all = predict_tau(trainer, Xt, et, ts_t, np.arange(len(Yt)))
-        pehe_f_te = pehe(taut[test_idx], tau_f_all[test_idx])
+        e_hat = ts_t[:, 3].copy()
+        assert ((e_hat > 0) & (e_hat < 1)).all(), "estimated propensity out of (0,1)"
 
-        tau_dr = dr_pseudo_tau(Xt, Tt, Yt, n_splits=3, seed=rep)
+        tau_f_all = predict_tau(trainer, Xt, e_hat, ts_t, np.arange(len(Yt)))
+        pehe_f_te = pehe(taut[test_idx], tau_f_all[test_idx])
+        pehe_zero = pehe(taut[test_idx], np.zeros(len(test_idx)))
+        # NOT deployable (uses true target tau); kept only as an upper reference.
+        pehe_const = pehe(taut[test_idx], np.full(len(test_idx), float(np.mean(taut[pool]))))
+        # Deployable constant: DR-estimated ATE in the SOURCE world, no target labels.
+        s_tr = idx_s["train_idx"]
+        src_ate = source_ate_estimate(Xs[s_tr], Ts[s_tr], Ys[s_tr], seed=rep)
+        pehe_src_ate = pehe(taut[test_idx], np.full(len(test_idx), src_ate))
+
+        print(
+            f"rep={rep}  frozen={pehe_f_te:.4f}  zero={pehe_zero:.4f}  "
+            f"const_oracle={pehe_const:.4f}  source_ate={pehe_src_ate:.4f}"
+        )
+
+        # DR only on pool
+        tau_dr = np.zeros(len(Yt), dtype=np.float32)
+        tau_dr[pool] = dr_pseudo_tau_util(
+            Xt[pool], Tt[pool], Yt[pool], n_splits=3, seed=rep, smooth=False
+        )
 
         for m in ms:
             for sup in supervisions:
-                rng_m = np.random.default_rng(rep * 10007 + m * 17 + deterministic_sup_offset(sup, 89))
+                rng_m = np.random.default_rng(
+                    rep * 10007 + m * 17 + deterministic_sup_offset(sup, 89)
+                )
                 sel = rng_m.choice(pool, size=min(m, len(pool)), replace=False)
 
                 if sup == "oracle_tau":
@@ -232,12 +224,23 @@ def main() -> None:
                     mode = "supervised_factual"
 
                 model_ad = adapt_fewshot(
-                    trainer.model, Xt[sel], Tt[sel], Yt[sel], et[sel], ts_t[sel],
-                    tau_k=tau_lab, mode=mode, device=args.device, steps=args.adapt_steps,
+                    trainer.model,
+                    Xt[sel], Tt[sel], Yt[sel], e_hat[sel], ts_t[sel],
+                    tau_k=tau_lab,
+                    mode=mode,
+                    device=args.device,
+                    n_updates=args.n_updates,
+                    entropy_weight=0.0,
+                    seed=int(rng_m.integers(0, 2**31 - 1)),
                 )
-                t_ad = GeometryAdaptiveTrainer(model_ad, device=args.device, pretrain_epochs=0, joint_epochs=0)
+                t_ad = GeometryAdaptiveTrainer(
+                    model_ad, device=args.device, pretrain_epochs=0, joint_epochs=0
+                )
                 t_ad.device = args.device
-                pehe_always = pehe(taut[test_idx], predict_tau(t_ad, Xt, et, ts_t, test_idx))
+                pehe_always = pehe(
+                    taut[test_idx],
+                    predict_tau(t_ad, Xt, e_hat, ts_t, test_idx),
+                )
 
                 rows.append({
                     "rep": rep,
@@ -246,14 +249,24 @@ def main() -> None:
                     "pehe_frozen": pehe_f_te,
                     "pehe_always_adapt": pehe_always,
                     "delta_always": pehe_f_te - pehe_always,
+                    "pehe_zero": pehe_zero,
+                    "pehe_const_oracle": pehe_const,
+                    "pehe_source_ate": pehe_src_ate,
+                    "n_updates": args.n_updates,
                 })
 
     df = pd.DataFrame(rows)
-    df.to_csv(Path(args.out_dir) / "table6_ihdp_x_ladder_raw.csv", index=False)
-    g = df.groupby(["m", "supervision"])[["pehe_frozen", "pehe_always_adapt", "delta_always"]].agg(["mean", "std"])
+    out = Path(args.out_dir)
+    df.to_csv(out / "table6_ihdp_x_ladder_raw.csv", index=False)
+    g = (
+        df.groupby(["m", "supervision"])[
+            ["pehe_frozen", "pehe_always_adapt", "delta_always", "pehe_zero", "pehe_const_oracle", "pehe_source_ate"]
+        ]
+        .agg(["mean", "std"])
+    )
     g.columns = ["_".join(c) for c in g.columns]
     g = g.reset_index()
-    g.to_csv(Path(args.out_dir) / "table6_ihdp_x_ladder_summary.csv", index=False)
+    g.to_csv(out / "table6_ihdp_x_ladder_summary.csv", index=False)
     print(g.to_string(index=False))
 
 

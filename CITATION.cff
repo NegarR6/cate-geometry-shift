@@ -1,13 +1,10 @@
 cff-version: 1.2.0
-message: "If you use this software or benchmark designs in your research, please cite our paper."
-title: "Geometry-Dependent Rankings of CATE Estimators and the Information Cost of Performance Recovery under Pure Effect-Surface Shift"
+message: "If you use this software or benchmark designs, please cite the paper."
+title: "Geometry-Dependent Rankings of CATE Estimators and the Supervision Cost of Adaptation under Pure Effect-Surface Shift"
 authors:
   - family-names: "Rezaei"
     given-names: "Negar"
-    affiliation: "School of Mathematics & Computer Science, Iran University of Science and Technology"
   - family-names: "Moeini"
     given-names: "Ehsan"
-    affiliation: "School of Mathematics & Computer Science, Iran University of Science and Technology"
 version: 1.0.0
-date-released: 2026-10-14
 license: MIT

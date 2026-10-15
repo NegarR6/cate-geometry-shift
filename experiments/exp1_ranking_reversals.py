@@ -1,21 +1,17 @@
 """
-Run SYNTHETIC_SPEC_v1 experiment.
+Ranking reversals across effect-surface geometries (Q1 / Fig 1–2).
 
-Usage:
-  python -m src.run_synthetic_regimes --regimes A,B,C --signals 0.5,1.0,2.0 --seeds 0-9
-
-Optional quick smoke:
-  python -m src.run_synthetic_regimes --regimes A,B --signals 0.5,2.0 --seeds 0-2 --epochs 40
-
-Outputs under results/synthetic_regimes/
+P0 FIXES vs original:
+- Early stopping uses a held-out validation slice (20% of train), NOT training loss.
+- IPM (mean-diff) is applied through CausalLoss on the shared representation; it is
+  mandatory (raises if it is identically zero). No try/except-pass anywhere.
+- ripo_no_tree uses tree_signals=None (pure FT path), not zero-filled tree tokens.
+- TARNet_FTTransformer is built with num_continuous= (the previous num_features=
+  raised TypeError and the model silently disappeared from the results).
+- Any model failure aborts the run (use --continue_on_error only for debugging).
+- Hyperparameters are explicit CLI/DEFAULT_NEURAL_HP and written to synthetic_meta.json.
 """
-
 from __future__ import annotations
-import sys as _sys, pathlib as _pl
-_ROOT = _pl.Path(__file__).resolve().parent.parent
-if str(_ROOT) not in _sys.path: _sys.path.insert(0, str(_ROOT))
-if str(_ROOT / 'src') not in _sys.path: _sys.path.insert(0, str(_ROOT / 'src'))
-
 
 import argparse
 import json
@@ -28,14 +24,22 @@ import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "src"))
+
 OUT_DIR = ROOT / "results" / "synthetic_regimes"
 
 from src.synthetic_regimes import (  # noqa: E402
-    SIGNAL_LEVELS,
     SyntheticConfig,
     compute_all_norm_constants,
     generate_synthetic,
     split_train_test,
+)
+
+
+DEFAULT_NEURAL_HP: Dict[str, Any] = dict(
+    d_token=32, num_layers=3, nhead=4, dim_feedforward=64, dropout=0.1,
+    head_hidden_dim=64, lr=1e-3, weight_decay=1e-5, batch_size=128,
 )
 
 
@@ -62,10 +66,8 @@ def ate_error(tau_hat: np.ndarray, tau_true: np.ndarray) -> float:
 def policy_value_and_regret(
     tau_hat: np.ndarray, tau_true: np.ndarray, treat_threshold: float = 0.0
 ) -> Tuple[float, float]:
-    """Simple decision: treat if tau_hat > threshold. Value under true tau."""
     a_hat = (tau_hat > treat_threshold).astype(np.float64)
     a_star = (tau_true > treat_threshold).astype(np.float64)
-    # potential outcomes relative: treating yields tau_true if treated vs 0 control scale
     v_hat = float(np.mean(a_hat * tau_true))
     v_star = float(np.mean(a_star * tau_true))
     return v_hat, float(v_star - v_hat)
@@ -76,11 +78,8 @@ def policy_value_and_regret(
 # ---------------------------------------------------------------------------
 
 def fit_predict_xlearner(X_tr, T_tr, Y_tr, X_te, seed: int) -> np.ndarray:
-    try:
-        from econml.metalearners import XLearner
-        from sklearn.ensemble import GradientBoostingRegressor, RandomForestClassifier
-    except ImportError as e:
-        raise ImportError("econml + sklearn required for X-Learner") from e
+    from econml.metalearners import XLearner
+    from sklearn.ensemble import GradientBoostingRegressor, RandomForestClassifier
 
     models = GradientBoostingRegressor(random_state=seed)
     propensity = RandomForestClassifier(n_estimators=100, max_depth=6, random_state=seed)
@@ -90,11 +89,8 @@ def fit_predict_xlearner(X_tr, T_tr, Y_tr, X_te, seed: int) -> np.ndarray:
 
 
 def fit_predict_causalforest(X_tr, T_tr, Y_tr, X_te, seed: int) -> np.ndarray:
-    try:
-        from econml.dml import CausalForestDML
-        from sklearn.ensemble import GradientBoostingRegressor
-    except ImportError as e:
-        raise ImportError("econml required for CausalForest") from e
+    from econml.dml import CausalForestDML
+    from sklearn.ensemble import GradientBoostingRegressor
 
     est = CausalForestDML(
         model_y=GradientBoostingRegressor(random_state=seed),
@@ -113,272 +109,116 @@ def fit_predict_neural(
     seed: int,
     epochs: int,
     patience: int,
-    allow_fallback: bool = False,
+    ipm_weight: float = 0.1,
+    val_frac: float = 0.2,
+    hp: Dict[str, Any] | None = None,
 ) -> np.ndarray:
     """
-    Project models only by default (RIPOAttention / TARNet_FTTransformer).
-    Fallback Mini-TARNet only if allow_fallback=True (NOT for paper numbers).
+    RIPO (pure path, tree_signals=None) or FT-TARNet.
+
+    - Early stopping on a held-out validation slice (factual MSE only).
+    - Training loss = CausalLoss = factual MSE + ipm_weight * mean-diff IPM on the
+      shared representation z. IPM is REQUIRED (no silent skipping): if
+      ipm_weight > 0 and the IPM term is identically zero over training, we raise.
     """
-    try:
-        return _fit_predict_project_neural(name, X_tr, T_tr, Y_tr, X_te, seed, epochs, patience)
-    except Exception as e:
-        if not allow_fallback:
-            raise RuntimeError(
-                "Project neural path failed for %s: %s. "
-                "Fix model wiring; do not use fallback for paper synthetic runs."
-                % (name, e)
-            ) from e
-        print(f"  [warn] project neural path failed ({e}); using minimal fallback")
-        return _fit_predict_minimal_tarnet(X_tr, T_tr, Y_tr, X_te, seed, epochs, patience)
-
-
-def _fit_predict_project_neural(name, X_tr, T_tr, Y_tr, X_te, seed, epochs, patience):
-    """Wire to real project classes: RIPOAttention, TARNet_FTTransformer."""
-    import inspect
     import torch
     from torch.utils.data import DataLoader, TensorDataset
+    from src.train_neural import CausalLoss
 
+    hp = {**DEFAULT_NEURAL_HP, **(hp or {})}
     torch.manual_seed(seed)
     np.random.seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     n_features = int(X_tr.shape[1])
 
-    def _construct(cls, extra_kwargs=None):
-        """Match __init__ parameters that exist on the class."""
-        extra_kwargs = dict(extra_kwargs or {})
-        sig = inspect.signature(cls.__init__)
-        params = set(sig.parameters.keys()) - {"self"}
-        candidates = {
-            "n_features": n_features,
-            "input_dim": n_features,
-            "d_in": n_features,
-            "n_cont_features": n_features,
-            "num_features": n_features,
-            "num_continuous": n_features,
-            "num_categories": 0,
-            "cat_cardinalities": None,
-            "in_dim": n_features,
-            "d_token": 32,
-            "num_layers": 3,
-            "n_layers": 3,
-            "nhead": 4,
-            "n_heads": 4,
-            "dim_feedforward": 64,
-            "d_ffn": 64,
-            "dropout": 0.1,
-            "head_hidden_dim": 64,
-            "hidden_dim": 64,
-            "ipm_weight": 0.1,
-            "residual_alpha": 0.25,
-            # IMPORTANT: tree_signal_dim=0 creates Linear(0,*) and crashes.
-            # Paper no-tree path keeps dim=4 and feeds zeros (see locked HP).
-            "tree_signal_dim": 4,
-            "use_tree_signals": False,
-            "use_tree": False,
-            "with_tree": False,
-            "n_tree_features": 4,
-        }
-        candidates.update(extra_kwargs)
-        kwargs = {k: v for k, v in candidates.items() if k in params}
-        # required params without default must be filled
-        for pname, param in sig.parameters.items():
-            if pname == "self":
-                continue
-            if param.default is inspect.Parameter.empty and pname not in kwargs:
-                # last resort guesses
-                if "feature" in pname or pname in ("d_in", "input_dim", "in_dim"):
-                    kwargs[pname] = n_features
-                elif pname in ("d_token", "hidden_dim", "dim"):
-                    kwargs[pname] = 32
-        print(f"  constructing {cls.__name__}({kwargs})")
-        return cls(**kwargs)
-
     if name == "ripo_no_tree":
         from src.models_hybrid_v2 import RIPOAttention
-
-        model = _construct(
-            RIPOAttention,
-            {
-                "use_tree_signals": False,
-                "use_tree": False,
-                "with_tree": False,
-                "tree_signal_dim": 4,
-                "n_tree_features": 4,
-            },
+        model = RIPOAttention(
+            num_features=n_features,
+            tree_signal_dim=4,
+            d_token=hp["d_token"],
+            num_layers=hp["num_layers"],
+            nhead=hp["nhead"],
+            dim_feedforward=hp["dim_feedforward"],
+            dropout=hp["dropout"],
+            head_hidden_dim=hp["head_hidden_dim"],
         ).to(device)
     elif name == "ft_tarnet":
         from src.models_neural import TARNet_FTTransformer
-
-        model = _construct(TARNet_FTTransformer).to(device)
+        model = TARNet_FTTransformer(
+            num_continuous=n_features,          # NOTE: not `num_features`
+            d_token=hp["d_token"],
+            num_layers=hp["num_layers"],
+            nhead=hp["nhead"],
+            dim_feedforward=hp["dim_feedforward"],
+            dropout=hp["dropout"],
+            head_hidden_dim=hp["head_hidden_dim"],
+        ).to(device)
     else:
         raise ValueError(name)
 
+    def _forward(x):
+        """Return (y0, y1, z) with y0,y1 of shape [B] and z of shape [B, D]."""
+        if name == "ripo_no_tree":
+            y0, y1, z, _ = model(x, tree_signals=None)       # pure FT path
+        else:
+            y0, y1, z = model(x, return_representation=True)
+        return y0.reshape(-1), y1.reshape(-1), z
 
-    X_t = torch.tensor(X_tr, dtype=torch.float32, device=device)
-    T_t = torch.tensor(T_tr, dtype=torch.float32, device=device)
-    Y_t = torch.tensor(Y_tr, dtype=torch.float32, device=device)
-    # Zero tree signals for ripo_no_tree (dim must match tree_signal_dim=4)
-    tree_dim = 4
-    tree_tr = torch.zeros(len(X_tr), tree_dim, dtype=torch.float32, device=device)
-    tree_te = torch.zeros(len(X_te), tree_dim, dtype=torch.float32, device=device)
+    # ---- validation split (early stopping never sees the training loss) ----
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(len(X_tr))
+    n_val = max(32, int(val_frac * len(X_tr)))
+    va_idx, tr_idx = perm[:n_val], perm[n_val:]
 
-    def _forward_y0y1(model, x, t=None, tree=None):
-        """Try common forward signatures; return (y0, y1) tensors."""
-        trials = []
-        if tree is not None and t is not None:
-            trials.extend([
-                lambda: model(x, t, tree),
-                lambda: model(x, tree, t),
-                lambda: model(x, t, tree_signals=tree),
-                lambda: model(x, tree_signals=tree),
-            ])
-        if t is not None:
-            trials.append(lambda: model(x, t))
-        trials.append(lambda: model(x))
-        if hasattr(model, "predict_ite"):
-            trials.append(lambda: model.predict_ite(x))
-        last_err = None
-        for fn in trials:
-            try:
-                out = fn()
-            except Exception as e:
-                last_err = e
-                continue
-            if isinstance(out, dict):
-                if "y0" in out and "y1" in out:
-                    return out["y0"].squeeze(), out["y1"].squeeze()
-                if "mu0" in out and "mu1" in out:
-                    return out["mu0"].squeeze(), out["mu1"].squeeze()
-                if "tau" in out:
-                    # fabricate y0=0, y1=tau for loss only if needed
-                    tau = out["tau"].squeeze()
-                    return torch.zeros_like(tau), tau
-            if isinstance(out, (tuple, list)):
-                if len(out) >= 2:
-                    a, b = out[0], out[1]
-                    if torch.is_tensor(a) and torch.is_tensor(b):
-                        return a.squeeze(), b.squeeze()
-                if len(out) == 1 and torch.is_tensor(out[0]):
-                    # single tau
-                    tau = out[0].squeeze()
-                    return torch.zeros_like(tau), tau
-            if torch.is_tensor(out):
-                tau = out.squeeze()
-                return torch.zeros_like(tau), tau
-        raise RuntimeError(f"Could not parse model forward output; last_err={last_err}")
+    def _t(a, idx):
+        return torch.tensor(np.asarray(a)[idx], dtype=torch.float32, device=device)
 
-    ds = TensorDataset(X_t, T_t, Y_t, tree_tr)
-    loader = DataLoader(ds, batch_size=min(128, len(X_tr)), shuffle=True)
+    X_t, T_t, Y_t = _t(X_tr, tr_idx), _t(T_tr, tr_idx), _t(Y_tr, tr_idx)
+    X_va, T_va, Y_va = _t(X_tr, va_idx), _t(T_tr, va_idx), _t(Y_tr, va_idx)
 
-    opt = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
-    best_loss = float("inf")
-    bad = 0
-    best_state = None
-    model.train()
-    for epoch in range(epochs):
-        total = 0.0
-        nobs = 0
-        for xb, tb, yb, treeb in loader:
+    causal = CausalLoss(ipm_weight=ipm_weight, ipm_type="mean_diff")
+    loader = DataLoader(
+        TensorDataset(X_t, T_t, Y_t), batch_size=min(hp["batch_size"], len(tr_idx)), shuffle=True
+    )
+    opt = torch.optim.Adam(model.parameters(), lr=hp["lr"], weight_decay=hp["weight_decay"])
+
+    best_val, bad, best_state = float("inf"), 0, None
+    ipm_total = 0.0
+    for _epoch in range(epochs):
+        model.train()
+        for xb, tb, yb in loader:
             opt.zero_grad()
-            y0, y1 = _forward_y0y1(model, xb, tb, treeb if name == "ripo_no_tree" else None)
-            pred = tb * y1 + (1.0 - tb) * y0
-            loss = torch.mean((pred - yb) ** 2)
-            if hasattr(model, "ipm_loss"):
-                try:
-                    loss = loss + 0.1 * model.ipm_loss(xb, tb)
-                except Exception:
-                    pass
+            y0, y1, z = _forward(xb)
+            loss, _outcome, ipm_term = causal(y0, y1, yb, tb, z)
+            ipm_total += float(ipm_term.detach())
             loss.backward()
             opt.step()
-            total += float(loss.item()) * len(xb)
-            nobs += len(xb)
-        epoch_loss = total / max(nobs, 1)
-        if epoch_loss < best_loss - 1e-5:
-            best_loss = epoch_loss
-            bad = 0
+
+        model.eval()
+        with torch.no_grad():
+            y0v, y1v, _ = _forward(X_va)
+            pred_va = T_va * y1v + (1.0 - T_va) * y0v
+            val_loss = float(torch.mean((pred_va - Y_va) ** 2).item())
+
+        if val_loss < best_val - 1e-5:
+            best_val, bad = val_loss, 0
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
         else:
             bad += 1
             if bad >= patience:
                 break
+
+    if ipm_weight > 0 and ipm_total == 0.0:
+        raise RuntimeError(
+            "IPM term was identically zero during training although ipm_weight > 0; "
+            "check that both treatment arms appear in mini-batches."
+        )
     if best_state is not None:
         model.load_state_dict(best_state)
     model.eval()
     with torch.no_grad():
-        Xte = torch.tensor(X_te, dtype=torch.float32, device=device)
-        T0 = torch.zeros(len(X_te), dtype=torch.float32, device=device)
-        y0, y1 = _forward_y0y1(
-            model, Xte, T0, tree_te if name == "ripo_no_tree" else None
-        )
-        tau_hat = (y1 - y0).cpu().numpy()
-    return np.asarray(tau_hat, dtype=np.float64).reshape(-1)
-
-
-
-def _nargs(model) -> int:
-    import inspect
-    try:
-        return len(inspect.signature(model.forward).parameters)
-    except Exception:
-        return 2
-
-
-def _fit_predict_minimal_tarnet(X_tr, T_tr, Y_tr, X_te, seed, epochs, patience):
-    """Minimal shared-representation TARNet fallback (PyTorch)."""
-    import torch
-    import torch.nn as nn
-    from torch.utils.data import DataLoader, TensorDataset
-
-    torch.manual_seed(seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    p = X_tr.shape[1]
-
-    class MiniTARNet(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.phi = nn.Sequential(
-                nn.Linear(p, 64), nn.ReLU(), nn.Linear(64, 32), nn.ReLU()
-            )
-            self.h0 = nn.Sequential(nn.Linear(32, 32), nn.ReLU(), nn.Linear(32, 1))
-            self.h1 = nn.Sequential(nn.Linear(32, 32), nn.ReLU(), nn.Linear(32, 1))
-
-        def forward(self, x):
-            z = self.phi(x)
-            return self.h0(z).squeeze(-1), self.h1(z).squeeze(-1)
-
-    model = MiniTARNet().to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
-    X_t = torch.tensor(X_tr, dtype=torch.float32, device=device)
-    T_t = torch.tensor(T_tr, dtype=torch.float32, device=device)
-    Y_t = torch.tensor(Y_tr, dtype=torch.float32, device=device)
-    loader = DataLoader(TensorDataset(X_t, T_t, Y_t), batch_size=128, shuffle=True)
-
-    best, bad, state = float("inf"), 0, None
-    for _ in range(epochs):
-        model.train()
-        total, nobs = 0.0, 0
-        for xb, tb, yb in loader:
-            opt.zero_grad()
-            y0, y1 = model(xb)
-            pred = tb * y1 + (1 - tb) * y0
-            loss = torch.mean((pred - yb) ** 2)
-            loss.backward()
-            opt.step()
-            total += float(loss.item()) * len(xb)
-            nobs += len(xb)
-        el = total / max(nobs, 1)
-        if el < best - 1e-5:
-            best, bad = el, 0
-            state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-        else:
-            bad += 1
-            if bad >= patience:
-                break
-    if state is not None:
-        model.load_state_dict(state)
-    model.eval()
-    with torch.no_grad():
-        y0, y1 = model(torch.tensor(X_te, dtype=torch.float32, device=device))
+        y0, y1, _ = _forward(torch.tensor(np.asarray(X_te), dtype=torch.float32, device=device))
         tau_hat = (y1 - y0).cpu().numpy()
     return np.asarray(tau_hat, dtype=np.float64).reshape(-1)
 
@@ -390,6 +230,7 @@ def run_one(
     seed: int,
     epochs: int,
     patience: int,
+    ipm_weight: float = 0.1,
 ) -> Dict[str, float]:
     X_tr, T_tr, Y_tr = data_tr["X"], data_tr["T"], data_tr["Y"]
     X_te, tau_te = data_te["X"], data_te["tau"]
@@ -399,7 +240,9 @@ def run_one(
     elif model == "causalforest":
         tau_hat = fit_predict_causalforest(X_tr, T_tr, Y_tr, X_te, seed)
     elif model in ("ripo_no_tree", "ft_tarnet"):
-        tau_hat = fit_predict_neural(model, X_tr, T_tr, Y_tr, X_te, seed, epochs, patience)
+        tau_hat = fit_predict_neural(
+            model, X_tr, T_tr, Y_tr, X_te, seed, epochs, patience, ipm_weight=ipm_weight
+        )
     else:
         raise ValueError(model)
 
@@ -426,8 +269,6 @@ def summarize(raw: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
         )
         .reset_index()
     )
-
-    # winner frequency
     winners = []
     for (regime, signal), sub in raw.groupby(["regime", "signal"]):
         for seed, ssub in sub.groupby("seed"):
@@ -444,45 +285,6 @@ def summarize(raw: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     return summary, freq
 
 
-def wilcoxon_key_pairs(raw: pd.DataFrame) -> pd.DataFrame:
-    from scipy.stats import wilcoxon
-
-    pairs = [
-        ("ripo_no_tree", "xlearner"),
-        ("ripo_no_tree", "causalforest"),
-        ("ripo_no_tree", "ft_tarnet"),
-        ("xlearner", "causalforest"),
-    ]
-    rows = []
-    for (regime, signal), sub in raw.groupby(["regime", "signal"]):
-        for a, b in pairs:
-            da = sub[sub.model == a].set_index("seed")["PEHE"]
-            db = sub[sub.model == b].set_index("seed")["PEHE"]
-            common = da.index.intersection(db.index)
-            if len(common) < 5:
-                continue
-            x, y = da.loc[common].values, db.loc[common].values
-            try:
-                stat, p = wilcoxon(x, y)
-            except Exception:
-                stat, p = np.nan, np.nan
-            rows.append(
-                {
-                    "regime": regime,
-                    "signal": signal,
-                    "model_a": a,
-                    "model_b": b,
-                    "n": len(common),
-                    "mean_a": float(np.mean(x)),
-                    "mean_b": float(np.mean(y)),
-                    "diff_a_minus_b": float(np.mean(x) - np.mean(y)),
-                    "wilcoxon_stat": stat,
-                    "wilcoxon_p": p,
-                }
-            )
-    return pd.DataFrame(rows)
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--regimes", type=str, default="A,B,C")
@@ -493,6 +295,9 @@ def main():
     parser.add_argument("--patience", type=int, default=15)
     parser.add_argument("--n", type=int, default=3000)
     parser.add_argument("--p", type=int, default=12)
+    parser.add_argument("--ipm_weight", type=float, default=0.1)
+    parser.add_argument("--continue_on_error", action="store_true",
+                        help="debug only: record NaN rows instead of aborting")
     args = parser.parse_args()
 
     regimes = [r.strip() for r in args.regimes.split(",")]
@@ -504,7 +309,6 @@ def main():
     norm_constants = compute_all_norm_constants(p=args.p)
     print("Norm constants:", norm_constants)
     print(f"Grid: regimes={regimes} signals={signals} seeds={seeds} models={models}")
-    print(f"Total runs: {len(regimes)*len(signals)*len(seeds)*len(models)}")
 
     rows: List[Dict[str, Any]] = []
     t0 = time.time()
@@ -519,7 +323,7 @@ def main():
                 for model in models:
                     print(f"=== regime={regime} signal={signal} seed={seed} model={model} ===")
                     try:
-                        metrics = run_one(model, tr, te, seed, args.epochs, args.patience)
+                        metrics = run_one(model, tr, te, seed, args.epochs, args.patience, args.ipm_weight)
                         print(f"  PEHE={metrics['PEHE']:.4f} ATE_Err={metrics['ATE_Error']:.4f}")
                         rows.append(
                             {
@@ -533,6 +337,8 @@ def main():
                             }
                         )
                     except Exception as e:
+                        if not args.continue_on_error:
+                            raise
                         print(f"  FAILED: {e}")
                         rows.append(
                             {
@@ -549,22 +355,21 @@ def main():
                                 "error": str(e),
                             }
                         )
-                    # incremental save
                     pd.DataFrame(rows).to_csv(OUT_DIR / "synthetic_raw.csv", index=False)
 
     raw = pd.DataFrame(rows)
     raw.to_csv(OUT_DIR / "synthetic_raw.csv", index=False)
-    summary, freq = summarize(raw.dropna(subset=["PEHE"]))
+    n_failed = int(raw["PEHE"].isna().sum())
+    expected = len(regimes) * len(signals) * len(seeds) * len(models)
+    if n_failed or len(raw) != expected:
+        raise SystemExit(f"{n_failed} failed runs / {len(raw)} of {expected} expected; "
+                         "refusing to summarise an incomplete grid")
+    summary, freq = summarize(raw)
     summary.to_csv(OUT_DIR / "synthetic_summary_by_cell.csv", index=False)
     freq.to_csv(OUT_DIR / "synthetic_winner_freq.csv", index=False)
-    try:
-        w = wilcoxon_key_pairs(raw.dropna(subset=["PEHE"]))
-        w.to_csv(OUT_DIR / "synthetic_wilcoxon.csv", index=False)
-    except Exception as e:
-        print("Wilcoxon failed:", e)
 
     meta_out = {
-        "spec": "SYNTHETIC_SPEC_v1",
+        "spec": "synthetic-spec",
         "norm_constants": norm_constants,
         "regimes": regimes,
         "signals": signals,
@@ -574,6 +379,12 @@ def main():
         "p": args.p,
         "epochs": args.epochs,
         "patience": args.patience,
+        "early_stopping": "validation_20pct",
+        "ipm_weight": args.ipm_weight,
+        "ipm_type": "mean_diff",
+        "neural_hparams": DEFAULT_NEURAL_HP,
+        "continue_on_error": bool(args.continue_on_error),
+        "ripo_tree_path": "None (pure FT)",
         "elapsed_sec": time.time() - t0,
     }
     (OUT_DIR / "synthetic_meta.json").write_text(json.dumps(meta_out, indent=2))

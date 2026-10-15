@@ -412,8 +412,12 @@ class GeometryAdaptiveCATE(nn.Module):
         out = self._expert_outputs(x, tree_signals)
         tau_stack = torch.stack([out["tau_n"], out["tau_t"]], dim=1)  # [B, 2]
 
+        # Router inputs are diagnostics about the independently fitted experts,
+        # not a path for routing-label gradients to rewrite those experts.
+        # The experts still receive gradients from the factual mixture objective
+        # if a caller explicitly enables Stage-2 expert fine-tuning.
         geom_feat = build_geometry_features_torch(
-            tau_stack, propensity, extra=extra_features
+            tau_stack.detach(), propensity, extra=extra_features
         )
         weights, logits = self.router(geom_feat)  # [B, 2]
 

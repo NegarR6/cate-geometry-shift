@@ -131,7 +131,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pair", default="A-B")
     ap.add_argument("--lambdas", default="0,0.25,0.5,0.75,1")
-    ap.add_argument("--n_seeds", type=int, default=3)
+    ap.add_argument("--n_seeds", type=int, default=5)
     ap.add_argument("--n", type=int, default=2000)
     ap.add_argument("--p", type=int, default=12)
     ap.add_argument("--signal", type=float, default=1.0)

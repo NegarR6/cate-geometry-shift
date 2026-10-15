@@ -1,19 +1,35 @@
-import sys as _sys, pathlib as _pl
+"""Leakage-safe tree signals for hybrid / geometry-adaptive models.
+
+P0 FIXES:
+- xgboost is REQUIRED (no silent sklearn GBR fallback that changes results).
+- Propensity uses LogisticRegression (better calibrated) instead of
+  RandomForestClassifier with class_weight='balanced' that pulls toward 0.5.
+- Explicit documentation that transform() uses full-data models fitted after
+  OOF scoring; callers must freeze source trees when evaluating on target.
+"""
+from __future__ import annotations
+
+import sys as _sys
+import pathlib as _pl
+
 _ROOT = _pl.Path(__file__).resolve().parent.parent
-if str(_ROOT) not in _sys.path: _sys.path.insert(0, str(_ROOT))
-if str(_ROOT / 'src') not in _sys.path: _sys.path.insert(0, str(_ROOT / 'src'))
-"""Leakage-safe tree signals for the RIPO hybrid model."""
+if str(_ROOT) not in _sys.path:
+    _sys.path.insert(0, str(_ROOT))
+if str(_ROOT / "src") not in _sys.path:
+    _sys.path.insert(0, str(_ROOT / "src"))
 
 import numpy as np
+from sklearn.base import clone
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import StratifiedKFold
+
 try:
     import xgboost as xgb
-    _HAS_XGB = True
-except ImportError:
-    xgb = None
-    _HAS_XGB = False
-from sklearn.base import clone
-from sklearn.ensemble import GradientBoostingRegressor, RandomForestClassifier
-from sklearn.model_selection import StratifiedKFold
+except ImportError as exc:
+    raise ImportError(
+        "xgboost is required for tree_signals (results are not reproducible "
+        "with a silent sklearn fallback). Install via: pip install xgboost>=1.7.0"
+    ) from exc
 
 
 class CrossFittedTreeSignals:
@@ -21,37 +37,30 @@ class CrossFittedTreeSignals:
 
     Training rows are never scored by a nuisance model fitted on those rows.
     After cross-fitting, full-data models are fitted solely for validation/test
-    transformation.
+    transformation. When transferring under pure geometry shift, callers MUST
+    freeze the source-fitted extractor (call transform on target X only; never
+    re-fit on target outcomes).
     """
 
     def __init__(self, n_splits=5, seed=42, n_estimators=200, max_depth=4):
         self.n_splits = n_splits
         self.seed = seed
-        if _HAS_XGB:
-            self.outcome_template = xgb.XGBRegressor(
-                n_estimators=n_estimators,
-                max_depth=max_depth,
-                learning_rate=0.05,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                objective="reg:squarederror",
-                random_state=seed,
-                n_jobs=4,
-            )
-        else:
-            self.outcome_template = GradientBoostingRegressor(
-                n_estimators=n_estimators,
-                max_depth=max_depth,
-                learning_rate=0.05,
-                subsample=0.8,
-                random_state=seed,
-            )
-        self.propensity_template = RandomForestClassifier(
-            n_estimators=200,
-            min_samples_leaf=10,
-            class_weight="balanced",
+        self.outcome_template = xgb.XGBRegressor(
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            objective="reg:squarederror",
             random_state=seed,
             n_jobs=4,
+            verbosity=0,
+        )
+        # Calibrated propensity (logistic) instead of RF + class_weight=balanced
+        self.propensity_template = LogisticRegression(
+            max_iter=500,
+            random_state=seed,
+            solver="lbfgs",
         )
 
     @staticmethod
@@ -77,7 +86,6 @@ class CrossFittedTreeSignals:
             tr0 = train_idx[w[train_idx] == 0]
             tr1 = train_idx[w[train_idx] == 1]
             # Leakage-safe guard: NEVER expand tr0/tr1 with held-out rows.
-            # Old code used np.where(w==0) which included held_idx → outcome leakage.
             if len(tr0) < 2 or len(tr1) < 2:
                 if len(np.unique(w[train_idx])) > 1 and len(train_idx) >= 2:
                     prop.fit(X[train_idx], w[train_idx])
@@ -101,12 +109,18 @@ class CrossFittedTreeSignals:
         self.model1_ = clone(self.outcome_template).fit(X[treated], y[treated])
         self.propensity_ = clone(self.propensity_template).fit(X, w)
         importance = (
-            self.model0_.feature_importances_ + self.model1_.feature_importances_
+            getattr(self.model0_, "feature_importances_", np.ones(X.shape[1]))
+            + getattr(self.model1_, "feature_importances_", np.ones(X.shape[1]))
         ) / 2
         self.feature_importance_ = importance / (importance.sum() + 1e-12)
         return self._pack(mu0, mu1, propensity)
 
     def transform(self, X):
+        """Transform using full-data models fitted on the SOURCE training set.
+
+        Under pure geometry shift this must be called on target X WITHOUT
+        re-fitting, so that no target outcomes leak into the tree pathway.
+        """
         if not hasattr(self, "model0_"):
             raise RuntimeError("fit_transform must be called before transform")
         X = np.asarray(X)

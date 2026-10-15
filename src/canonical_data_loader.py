@@ -1,5 +1,5 @@
 """
-Canonical Data Loader for RIPO / Hybrid-Causal ICLR project.
+Canonical Data Loader for RIPO / CATE geometry-shift project.
 
 STRICT RULES (enforced by design — do not weaken):
 - NO synthetic data generation of any kind.

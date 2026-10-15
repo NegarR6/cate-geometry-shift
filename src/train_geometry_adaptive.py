@@ -275,6 +275,7 @@ class GeometryAdaptiveTrainer:
         joint_patience: int = 15,
         freeze_experts_epochs: int = 8,
         expert_ft_lr_mult: float = 0.25,
+        freeze_experts_entire_stage2: bool = True,
     ):
         self.model = model.to(device)
         self.device = device
@@ -293,6 +294,12 @@ class GeometryAdaptiveTrainer:
         self.joint_patience = joint_patience
         self.freeze_experts_epochs = freeze_experts_epochs
         self.expert_ft_lr_mult = expert_ft_lr_mult
+        # For paper runs, Stage 1 defines the two factual experts and Stage 2
+        # trains only the router. This prevents oracle routing supervision from
+        # changing the expert-vs-expert comparison directly or indirectly via
+        # router-dependent factual gradients. Set False only for an explicit
+        # end-to-end fine-tuning ablation.
+        self.freeze_experts_entire_stage2 = bool(freeze_experts_entire_stage2)
 
         self.loss_fn = GeometryAdaptiveLoss(
             ipm_weight=ipm_weight,
@@ -444,9 +451,16 @@ class GeometryAdaptiveTrainer:
         self.best_state = None
 
         for epoch in range(1, self.joint_epochs + 1):
-            freeze = epoch <= self.freeze_experts_epochs
-            # rebuild optimizer when freeze status changes
-            if epoch == 1 or epoch == self.freeze_experts_epochs + 1:
+            freeze = (
+                self.freeze_experts_entire_stage2
+                or epoch <= self.freeze_experts_epochs
+            )
+            # Rebuild the optimizer only when an explicitly requested
+            # fine-tuning ablation transitions from frozen to trainable experts.
+            if epoch == 1 or (
+                not self.freeze_experts_entire_stage2
+                and epoch == self.freeze_experts_epochs + 1
+            ):
                 self.optimizer = self._build_optimizer(freeze_experts=freeze)
                 self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
                     self.optimizer, mode="min", factor=0.5, patience=5

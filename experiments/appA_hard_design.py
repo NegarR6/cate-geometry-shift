@@ -147,7 +147,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--regimes", default="A,B")
     ap.add_argument("--signals", default="1.0")
-    ap.add_argument("--seeds", default="0-4")
+    ap.add_argument("--seeds", default="0-9")
     ap.add_argument("--epochs", type=int, default=80)
     ap.add_argument("--patience", type=int, default=15)
     ap.add_argument("--n", type=int, default=5000)

@@ -193,9 +193,9 @@ def parse_pairs(s: str) -> List[Tuple[str, str]]:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--pairs", type=str, default="B>A,A>B")
-    ap.add_argument("--signals", type=str, default="0.5,2.0")
-    ap.add_argument("--seeds", type=str, default="0-2")
+    ap.add_argument("--pairs", type=str, default="A>B,A>C,B>A,B>C")
+    ap.add_argument("--signals", type=str, default="0.5,1.0,2.0")
+    ap.add_argument("--seeds", type=str, default="0-9")
     ap.add_argument("--epochs", type=int, default=40)
     ap.add_argument("--patience", type=int, default=10)
     ap.add_argument("--n", type=int, default=3000)

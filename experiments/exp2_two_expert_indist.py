@@ -284,7 +284,7 @@ def run_shift_experiment(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--n_seeds", type=int, default=3)
+    parser.add_argument("--n_seeds", type=int, default=10)
     parser.add_argument("--signal", type=float, default=1.0)
     parser.add_argument("--n", type=int, default=3000)
     parser.add_argument("--p", type=int, default=12)

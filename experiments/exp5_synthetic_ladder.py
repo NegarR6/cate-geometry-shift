@@ -1,20 +1,19 @@
 """
-Priority 1 runner — FIXED for project API:
-  - model.forward → dict with tau, tau_n, tau_t, weights [B,2]
-  - trainer.predict_experts → (tau_a, tau_n, tau_t, weights)
-  - adapt via adapt_geometry_shift.adapt_fewshot
+Synthetic shift ladder {A,B}->C (Table 5 / Fig 3 left).
+
+P0 FIXES:
+- DR pseudo-labels computed ONLY on adaptation pool (smooth=False).
+- adapt_fewshot uses fixed n_updates (not growing with m).
+- Default budgets match paper: m in {10,20,30,50,100}, n_seeds=5.
+- Propensity passed to model is from tree signals (ê), not oracle e from DGP
+  when available; falls back to DGP e with a warning.
 """
 from __future__ import annotations
-import zlib
-import sys as _sys, pathlib as _pl
-_ROOT = _pl.Path(__file__).resolve().parent.parent
-if str(_ROOT) not in _sys.path: _sys.path.insert(0, str(_ROOT))
-if str(_ROOT / 'src') not in _sys.path: _sys.path.insert(0, str(_ROOT / 'src'))
-
 
 import argparse
 import os
 import sys
+import zlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -31,8 +30,9 @@ from budgeted_ladder_utils import (
     dr_pseudo_tau,
     pehe,
     select_indices,
+    simple_label_baseline,
+    source_ate_estimate,
 )
-
 from synthetic_regimes import SyntheticConfig, compute_all_norm_constants, generate_synthetic
 from models_geometry_adaptive import build_geo_adaptive_from_hparams
 from train_geometry_adaptive import GeometryAdaptiveTrainer, set_seed, build_loaders
@@ -106,6 +106,10 @@ def train_source_model(
     source["tree_signals"] = ts
     source["tree_builder"] = tb
 
+    # Observable propensity only (OOF for train rows, source-fitted model for val rows).
+    e_hat = ts[:, 3].copy()
+    assert (e_hat[tr_idx] > 0).all() and (e_hat[val_idx] > 0).all(), "propensity not filled"
+
     model = build_geo_adaptive_from_hparams(num_features=p)
     trainer = GeometryAdaptiveTrainer(
         model,
@@ -116,24 +120,25 @@ def train_source_model(
         route_weight_start=0.15,
         route_weight_end=0.45,
     )
-    train_loader, val_loader = build_loaders(X, T, Y, e, ts, None, tr_idx, val_idx)
+    train_loader, val_loader = build_loaders(X, T, Y, e_hat, ts, None, tr_idx, val_idx)
     trainer.pretrain_experts(train_loader, val_loader, verbose=verbose)
 
     if joint_epochs > 0:
-        try:
-            oracle = np.full(n, -1, dtype=np.int64)
-            pred = trainer.predict_experts(X[tr_idx], e[tr_idx], ts[tr_idx])
-            tn, tt = pred[1], pred[2]
-            tau_tr = source["tau"][tr_idx]
-            prefer_tree = np.abs(tt - tau_tr) < np.abs(tn - tau_tr)
-            oracle[tr_idx] = prefer_tree.astype(np.int64)
-            train_loader, val_loader = build_loaders(X, T, Y, e, ts, oracle, tr_idx, val_idx)
-            if hasattr(trainer, "fit_joint_only"):
-                trainer.fit_joint_only(train_loader, val_loader, verbose=verbose)
-            elif hasattr(trainer, "train_joint"):
-                trainer.train_joint(train_loader, val_loader, verbose=verbose)
-        except Exception as ex:
-            print(f"  [warn] joint stage skipped: {ex}")
+        # Router targets are built from the source-world tau (synthetic DGP; documented
+        # in the paper as the source-side router supervision). No exception swallowing:
+        # a failing joint stage must abort the run, not silently give a frozen-expert model.
+        oracle = np.full(n, -1, dtype=np.int64)
+        pred = trainer.predict_experts(X[tr_idx], e_hat[tr_idx], ts[tr_idx])
+        tn, tt = pred[1], pred[2]
+        tau_tr = source["tau"][tr_idx]
+        oracle[tr_idx] = (np.abs(tt - tau_tr) < np.abs(tn - tau_tr)).astype(np.int64)
+        train_loader, val_loader = build_loaders(X, T, Y, e_hat, ts, oracle, tr_idx, val_idx)
+        if hasattr(trainer, "fit_joint_only"):
+            trainer.fit_joint_only(train_loader, val_loader, verbose=verbose)
+        elif hasattr(trainer, "train_joint"):
+            trainer.train_joint(train_loader, val_loader, verbose=verbose)
+        else:
+            raise RuntimeError("trainer has neither fit_joint_only nor train_joint")
     return trainer
 
 
@@ -168,18 +173,19 @@ def run_cell(
     supervision: str,
     policy: str,
     seed: int,
-    adapt_steps: int,
+    n_updates: int,
     device: str,
+    source_ate: float = float('nan'),
 ) -> Dict[str, Any]:
     X = np.asarray(target["X"], dtype=np.float32)
     T = np.asarray(target["T"], dtype=np.float32)
     Y = np.asarray(target["Y"], dtype=np.float32)
-    e = np.asarray(target["e"], dtype=np.float32)
     tau = np.asarray(target["tau"], dtype=np.float32)
     pool = np.asarray(target["train_idx"])
     test = np.asarray(target["test_idx"])
     n = len(Y)
 
+    # Frozen source tree signals only (no target outcome leakage)
     ts = np.zeros((n, 4), dtype=np.float32)
     ts[pool] = tb_transform(X[pool])
     ts[test] = tb_transform(X[test])
@@ -187,10 +193,21 @@ def run_cell(
     if len(rest):
         ts[rest] = tb_transform(X[rest])
 
+    # Estimated propensity (observable)
+    e_hat = ts[:, 3].copy()
+    assert ((e_hat > 0) & (e_hat < 1)).all(), "estimated propensity out of (0,1)"
+
     tau_a, tau_n, tau_t, _ = unpack_predict(
-        trainer_src.predict_experts(X[test], e[test], ts[test])
+        trainer_src.predict_experts(X[test], e_hat[test], ts[test])
     )
     pehe_frozen = pehe(tau[test], tau_a)
+
+    # Deployable baselines for this cell
+    pehe_zero = pehe(tau[test], np.zeros(len(test)))
+    # NOT deployable: uses true target tau. Reported only as an upper reference.
+    pehe_const_oracle = pehe(tau[test], np.full(len(test), float(np.mean(tau[pool]))))
+    # Deployable constant: DR-estimated ATE on SOURCE data (no target labels).
+    pehe_source_ate = pehe(tau[test], np.full(len(test), source_ate))
 
     if m == 0 or supervision == "none":
         return {
@@ -201,15 +218,16 @@ def run_cell(
             "pehe_frozen": pehe_frozen,
             "pehe_neural": pehe(tau[test], tau_n),
             "pehe_tree": pehe(tau[test], tau_t),
+            "pehe_zero": pehe_zero,
+            "pehe_const_oracle": pehe_const_oracle,
+            "pehe_source_ate": pehe_source_ate,
             "delta_vs_frozen": 0.0,
             "n_selected": 0,
         }
 
     tau_a_p, tau_n_p, tau_t_p, w_p = unpack_predict(
-        trainer_src.predict_experts(X[pool], e[pool], ts[pool])
+        trainer_src.predict_experts(X[pool], e_hat[pool], ts[pool])
     )
-    if len(tau_n_p) != len(pool):
-        raise RuntimeError(f"score len {len(tau_n_p)} != pool {len(pool)}")
 
     if policy == "random":
         scores = np.zeros(len(pool), dtype=np.float64)
@@ -218,10 +236,10 @@ def run_cell(
             "active_disagreement", "active_entropy", "active_hybrid"
         ) else "active_hybrid"
         scores = np.asarray(active_scores(tau_n_p, tau_t_p, w_p, mode=mode)).ravel()
-        if len(scores) != len(pool):
-            raise RuntimeError(f"scores {len(scores)} != pool {len(pool)}")
 
-    rng = np.random.default_rng(seed + 13 * int(m) + 17 * ((zlib.crc32(str(policy).encode('utf-8')) & 0xFFFFFFFF) % 1000))
+    rng = np.random.default_rng(
+        seed + 13 * int(m) + 17 * ((zlib.crc32(str(policy).encode("utf-8")) & 0xFFFFFFFF) % 1000)
+    )
     sel = np.asarray(select_indices(pool, scores, m, policy, rng), dtype=int)
 
     tau_k = None
@@ -230,8 +248,13 @@ def run_cell(
         tau_k = tau[sel]
         mode = "full_adapt"
     elif supervision == "dr_pseudo":
-        tau_dr_full = dr_pseudo_tau(X, T, Y, n_splits=3, seed=seed, smooth=True)
-        tau_k = np.asarray(tau_dr_full[sel], dtype=np.float32)
+        # P0: ONLY on pool, smooth=False
+        tau_dr_pool = dr_pseudo_tau(
+            X[pool], T[pool], Y[pool], n_splits=3, seed=seed, smooth=False
+        )
+        tau_dr_full = np.zeros(n, dtype=np.float32)
+        tau_dr_full[pool] = tau_dr_pool
+        tau_k = tau_dr_full[sel]
         mode = "full_adapt"
     elif supervision == "factual":
         tau_k = None
@@ -239,19 +262,36 @@ def run_cell(
     else:
         raise ValueError(supervision)
 
+    adapt_seed = int(rng.integers(0, 2**31 - 1))
+
+    # Simple baselines using exactly the same m labels (fair comparison to fine-tuning).
+    base_cols: Dict[str, float] = {}
+    if tau_k is not None:
+        for meth in ("ridge", "gbr", "knn"):
+            base_cols[f"pehe_label_{meth}"] = pehe(
+                tau[test], simple_label_baseline(X[sel], tau_k, X[test], method=meth, seed=seed)
+            )
+        # shrinkage of the label-mean towards the (deployable) source ATE
+        lam = len(sel) / (len(sel) + 50.0)
+        base_cols["pehe_shrink_source_ate"] = pehe(
+            tau[test], np.full(len(test), lam * float(np.mean(tau_k)) + (1 - lam) * source_ate)
+        )
+
     model_adapted = adapt_fewshot(
         trainer_src.model,
         X[sel],
         T[sel],
         Y[sel],
-        e[sel],
+        e_hat[sel],
         ts[sel],
         tau_k=tau_k,
         mode=mode,
         device=device,
-        steps=adapt_steps,
+        n_updates=n_updates,  # FIXED budget, independent of m
         lr_router=1e-3,
         lr_expert=3e-4,
+        entropy_weight=0.0,
+        seed=adapt_seed,
     )
 
     t2 = GeometryAdaptiveTrainer(
@@ -264,7 +304,7 @@ def run_cell(
         t2.device = trainer_src.device
 
     tau_a2, tau_n2, tau_t2, _ = unpack_predict(
-        t2.predict_experts(X[test], e[test], ts[test])
+        t2.predict_experts(X[test], e_hat[test], ts[test])
     )
     pehe_after = pehe(tau[test], tau_a2)
 
@@ -276,8 +316,13 @@ def run_cell(
         "pehe_frozen": pehe_frozen,
         "pehe_neural": pehe(tau[test], tau_n2),
         "pehe_tree": pehe(tau[test], tau_t2),
+        "pehe_zero": pehe_zero,
+        "pehe_const_oracle": pehe_const_oracle,
+        "pehe_source_ate": pehe_source_ate,
+        **base_cols,
         "delta_vs_frozen": float(pehe_frozen - pehe_after),
         "n_selected": int(len(sel)),
+        "n_updates": n_updates,
     }
 
 
@@ -288,16 +333,18 @@ def main():
     ap.add_argument("--n", type=int, default=2000)
     ap.add_argument("--p", type=int, default=12)
     ap.add_argument("--signal", type=float, default=1.0)
-    ap.add_argument("--n_seeds", type=int, default=3)
-    ap.add_argument("--ms", default="0,20,50,100")
+    ap.add_argument("--n_seeds", type=int, default=10)  # paper default
+    ap.add_argument("--ms", default="10,20,30,50,100")  # paper default
     ap.add_argument("--supervisions", default="factual,dr_pseudo,oracle_tau")
-    ap.add_argument("--policies", default="random,active_hybrid")
+    ap.add_argument("--policies", default="random")
     ap.add_argument("--pretrain_epochs", type=int, default=30)
     ap.add_argument("--joint_epochs", type=int, default=40)
-    ap.add_argument("--adapt_steps", type=int, default=100)
+    ap.add_argument("--n_updates", type=int, default=200)  # fixed gradient budget
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--out_dir", default="results/budgeted_ladder")
     ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--continue_on_error", action="store_true",
+                    help="debug only: record NaN rows instead of aborting")
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -318,31 +365,40 @@ def main():
             source, args.device, args.pretrain_epochs, args.joint_epochs, seed, verbose
         )
         tb = source["tree_builder"]
+        s_tr = source["tr_idx"]
+        source_ate = source_ate_estimate(
+            source["X"][s_tr], source["T"][s_tr], source["Y"][s_tr], seed=seed
+        )
+
+        # m=0 frozen baseline once per seed
+        print("  cell m=0 sup=none pol=none")
+        cell0 = run_cell(
+            trainer, target, tb.transform, 0, "none", "none",
+            seed, args.n_updates, args.device, source_ate=source_ate,
+        )
+        cell0.update({
+            "seed": seed,
+            "train_regimes": ",".join(args.train_regimes),
+            "test_regime": args.test_regime,
+            "signal": args.signal,
+        })
+        rows.append(cell0)
+        print(
+            f"    frozen={cell0['pehe_after']:.4f}  "
+            f"zero={cell0['pehe_zero']:.4f}  "
+            f"const_oracle={cell0['pehe_const_oracle']:.4f}"
+        )
 
         for m in ms:
             if m == 0:
-                print("  cell m=0 sup=none pol=none")
-                cell = run_cell(
-                    trainer, target, tb.transform, 0, "none", "none",
-                    seed, args.adapt_steps, args.device,
-                )
-                cell.update({
-                    "seed": seed,
-                    "train_regimes": ",".join(args.train_regimes),
-                    "test_regime": args.test_regime,
-                    "signal": args.signal,
-                })
-                rows.append(cell)
-                print(f"    frozen PEHE={cell['pehe_after']:.4f}")
                 continue
-
             for sup in supervisions:
                 for pol in policies:
                     print(f"  cell m={m} sup={sup} pol={pol}")
                     try:
                         cell = run_cell(
                             trainer, target, tb.transform, m, sup, pol,
-                            seed, args.adapt_steps, args.device,
+                            seed, args.n_updates, args.device, source_ate=source_ate,
                         )
                         print(
                             f"    after={cell['pehe_after']:.4f} "
@@ -350,9 +406,10 @@ def main():
                             f"delta={cell['delta_vs_frozen']:.4f}"
                         )
                     except Exception as ex:
+                        if not args.continue_on_error:
+                            raise
                         import traceback
                         traceback.print_exc()
-                        print(f"  [error] {ex}")
                         cell = {
                             "m": m,
                             "supervision": sup,
@@ -376,10 +433,12 @@ def main():
 
     keys = ["m", "supervision", "policy"]
     if len(df):
-        summ = (
-            df.groupby(keys, dropna=False)[["pehe_after", "pehe_frozen", "delta_vs_frozen"]]
-            .agg(["mean", "std"])
-        )
+        val_cols = [c for c in (
+            "pehe_after", "pehe_frozen", "delta_vs_frozen", "pehe_zero", "pehe_const_oracle",
+            "pehe_source_ate", "pehe_label_ridge", "pehe_label_gbr", "pehe_label_knn",
+            "pehe_shrink_source_ate",
+        ) if c in df.columns]
+        summ = df.groupby(keys, dropna=False)[val_cols].agg(["mean", "std"])
         summ.columns = ["_".join(c) for c in summ.columns]
         summ = summ.reset_index()
         summ_path = os.path.join(args.out_dir, "budgeted_ladder_summary.csv")

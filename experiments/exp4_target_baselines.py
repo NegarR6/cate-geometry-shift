@@ -1,170 +1,127 @@
-"""Target-domain baselines on Regime C (Table 4 of the paper) and budget-matched factual learners.
-
-Run from the project root:
-    python experiments/exp4_target_baselines.py
-    python experiments/exp4_target_baselines.py --run_budget_matched
-
-Uses the repository's synthetic generator with target seeds = seed + 99, n = 2000, p = 12, signal = 1.0
-(matching the target-generation convention in experiments/exp5_synthetic_ladder.py).
+"""
+Table 4 and Table 7 budget-matched target-only baselines on Regime C under {A,B}->C shift.
+Evaluated on the exact same 10 source and target splits as exp5_synthetic_ladder.py.
 """
 from __future__ import annotations
-import zlib
-import sys as _sys, pathlib as _pl
-_ROOT = _pl.Path(__file__).resolve().parent.parent
-if str(_ROOT) not in _sys.path: _sys.path.insert(0, str(_ROOT))
-if str(_ROOT / 'src') not in _sys.path: _sys.path.insert(0, str(_ROOT / 'src'))
 
-
-import argparse
 import sys
-from pathlib import Path
+import pathlib
+import argparse
+
+_ROOT = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_ROOT))
+sys.path.insert(0, str(_ROOT / "src"))
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import GradientBoostingRegressor as GBR
-from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import KFold
+from sklearn.ensemble import GradientBoostingRegressor
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "src"))
-sys.path.insert(0, str(ROOT))
-
-from synthetic_regimes import SyntheticConfig, compute_all_norm_constants, generate_synthetic
+from src.synthetic_regimes import generate_synthetic, SyntheticConfig, compute_all_norm_constants
+from src.budgeted_ladder_utils import dr_pseudo_tau, source_ate_estimate
 
 
-def rms(tau_true: np.ndarray, tau_pred: np.ndarray | float) -> float:
-    return float(np.sqrt(np.mean((tau_true - tau_pred) ** 2)))
+def pehe(tau_true, tau_pred):
+    return float(np.sqrt(np.mean((np.asarray(tau_true) - np.asarray(tau_pred)) ** 2)))
 
 
-def make_gbr(seed: int, n_estimators: int = 200) -> GBR:
-    return GBR(
-        n_estimators=n_estimators,
-        max_depth=3,
-        learning_rate=0.05,
-        subsample=0.8,
-        random_state=seed,
-    )
+def t_learner_predict(Xtr, Ttr, Ytr, Xte, seed=0):
+    m0 = GradientBoostingRegressor(n_estimators=100, max_depth=3, learning_rate=0.05, random_state=seed)
+    m1 = GradientBoostingRegressor(n_estimators=100, max_depth=3, learning_rate=0.05, random_state=seed)
+    ctrl = Ttr == 0
+    treated = Ttr == 1
+    m0.fit(Xtr[ctrl], Ytr[ctrl])
+    m1.fit(Xtr[treated], Ytr[treated])
+    return m1.predict(Xte) - m0.predict(Xte)
 
 
-def fit_t_learner(X_tr: np.ndarray, T_tr: np.ndarray, Y_tr: np.ndarray, X_te: np.ndarray, seed: int) -> np.ndarray:
-    g0 = make_gbr(seed, 200).fit(X_tr[T_tr == 0], Y_tr[T_tr == 0])
-    g1 = make_gbr(seed, 200).fit(X_tr[T_tr == 1], Y_tr[T_tr == 1])
-    return g1.predict(X_te) - g0.predict(X_te)
+def run_seed(seed: int, n: int = 2000, p: int = 12):
+    norms = compute_all_norm_constants(p=p)
+    # Target regime C (exact same seed+99 split as exp5_synthetic_ladder.py)
+    cfg = SyntheticConfig(n=n, p=p, regime="C", signal=1.0, seed=seed + 99)
+    data, _ = generate_synthetic(cfg, norm_constants=norms)
+    X, T, Y, tau = data["X"], data["T"].astype(int), data["Y"], data["tau"]
+    pool, test = data["train_idx"], data["test_idx"]
+
+    # Source data for deployable ATE (exact same seed+17*(i+1) split as exp5_synthetic_ladder.py)
+    Xs, Ts, Ys = [], [], []
+    offset = 0
+    src_train_parts = []
+    for i, reg in enumerate(["A", "B"]):
+        cfg_s = SyntheticConfig(n=n, p=p, seed=seed + 17 * (i + 1), regime=reg, signal=1.0)
+        d_s, _ = generate_synthetic(cfg_s, norm_constants=norms)
+        Xs.append(d_s["X"])
+        Ts.append(d_s["T"])
+        Ys.append(d_s["Y"])
+        src_train_parts.append(np.asarray(d_s["train_idx"]) + offset)
+        offset += len(d_s["Y"])
+    X_all = np.concatenate(Xs, axis=0).astype(np.float32)
+    T_all = np.concatenate(Ts, axis=0).astype(np.float32)
+    Y_all = np.concatenate(Ys, axis=0).astype(np.float32)
+    src_train_idx = np.concatenate(src_train_parts)
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(src_train_idx)
+    n_val = max(80, int(0.12 * len(perm)))
+    tr_idx = perm[n_val:]
+
+    rows = []
+    rows.append({"seed": seed, "estimator": "zero", "pehe": pehe(tau[test], np.zeros(len(test)))})
+    rows.append({"seed": seed, "estimator": "constant_oracle_ate", "pehe": pehe(tau[test], np.full(len(test), float(np.mean(tau[pool]))))})
+    ate_src = source_ate_estimate(X_all[tr_idx], T_all[tr_idx], Y_all[tr_idx], seed=seed)
+    rows.append({"seed": seed, "estimator": "source_ate", "pehe": pehe(tau[test], np.full(len(test), ate_src))})
+    pred_t = t_learner_predict(X[pool], T[pool], Y[pool], X[test], seed=seed)
+    rows.append({"seed": seed, "estimator": "target_T_learner_full", "pehe": pehe(tau[test], pred_t)})
+    tau_dr = dr_pseudo_tau(X[pool], T[pool], Y[pool], n_splits=3, seed=seed, smooth=False)
+    reg = GradientBoostingRegressor(n_estimators=100, max_depth=3, learning_rate=0.05, random_state=seed)
+    reg.fit(X[pool], tau_dr)
+    rows.append({"seed": seed, "estimator": "target_DR_learner_full", "pehe": pehe(tau[test], reg.predict(X[test]))})
+    return rows
 
 
-def fit_x_learner(X_tr: np.ndarray, T_tr: np.ndarray, Y_tr: np.ndarray, X_te: np.ndarray, seed: int) -> np.ndarray:
-    g0 = make_gbr(seed, 150).fit(X_tr[T_tr == 0], Y_tr[T_tr == 0])
-    g1 = make_gbr(seed, 150).fit(X_tr[T_tr == 1], Y_tr[T_tr == 1])
-    d1 = Y_tr[T_tr == 1] - g0.predict(X_tr[T_tr == 1])
-    d0 = g1.predict(X_tr[T_tr == 0]) - Y_tr[T_tr == 0]
-    tau1 = make_gbr(seed, 150).fit(X_tr[T_tr == 1], d1).predict(X_te)
-    tau0 = make_gbr(seed, 150).fit(X_tr[T_tr == 0], d0).predict(X_te)
-    e_te = np.clip(
-        LogisticRegression(max_iter=500, random_state=seed).fit(X_tr, T_tr).predict_proba(X_te)[:, 1],
-        0.05,
-        0.95,
-    )
-    return e_te * tau0 + (1.0 - e_te) * tau1
+def run_budget(seed: int, m: int, n: int = 2000, p: int = 12):
+    norms = compute_all_norm_constants(p=p)
+    cfg = SyntheticConfig(n=n, p=p, regime="C", signal=1.0, seed=seed + 99)
+    data, _ = generate_synthetic(cfg, norm_constants=norms)
+    X, T, Y, tau = data["X"], data["T"].astype(int), data["Y"], data["tau"]
+    pool, test = data["train_idx"], data["test_idx"]
+    if m >= len(pool):
+        sel = pool
+    else:
+        rng = np.random.default_rng(seed)
+        sel = rng.choice(pool, size=m, replace=False)
+    pred = t_learner_predict(X[sel], T[sel], Y[sel], X[test], seed=seed)
+    return {"seed": seed, "m": m, "estimator": "target_T_learner", "pehe": pehe(tau[test], pred)}
 
 
-def fit_dr_learner(X_tr: np.ndarray, T_tr: np.ndarray, Y_tr: np.ndarray, X_te: np.ndarray, seed: int) -> np.ndarray:
-    n = len(Y_tr)
-    e = np.zeros(n)
-    m0 = np.zeros(n)
-    m1 = np.zeros(n)
-    n_splits = 3 if n >= 30 else 2
-    for a, b in KFold(n_splits, shuffle=True, random_state=seed).split(X_tr):
-        Xa, Ta, Ya = X_tr[a], T_tr[a], Y_tr[a]
-        e[b] = np.clip(
-            LogisticRegression(max_iter=500, random_state=seed).fit(Xa, Ta).predict_proba(X_tr[b])[:, 1],
-            0.05,
-            0.95,
-        )
-        m0[b] = GBR(n_estimators=150, max_depth=3, learning_rate=0.05, random_state=seed).fit(
-            Xa[Ta == 0], Ya[Ta == 0]
-        ).predict(X_tr[b])
-        m1[b] = GBR(n_estimators=150, max_depth=3, learning_rate=0.05, random_state=seed).fit(
-            Xa[Ta == 1], Ya[Ta == 1]
-        ).predict(X_tr[b])
-    phi = (m1 - m0) + T_tr * (Y_tr - m1) / e - (1.0 - T_tr) * (Y_tr - m0) / (1.0 - e)
-    return GBR(n_estimators=150, max_depth=3, learning_rate=0.05, random_state=seed).fit(X_tr, phi).predict(X_te)
-
-
-def main() -> None:
+def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--n_seeds", type=int, default=10)
+    ap.add_argument("--run_budget_matched", action="store_true", default=True)
     ap.add_argument("--out_dir", default="results")
-    ap.add_argument("--run_budget_matched", action="store_true", help="Also evaluate target-only learners at m in {20,50,100,200,400,1400}")
     args = ap.parse_args()
 
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out = pathlib.Path(args.out_dir)
+    out.mkdir(parents=True, exist_ok=True)
 
-    norm = compute_all_norm_constants(p=12)
-    rows = []
-    budget_rows = []
-    budgets = [20, 50, 100, 200, 400, 1400]
+    all_rows = []
+    for s in range(args.n_seeds):
+        all_rows.extend(run_seed(s))
+    df = pd.DataFrame(all_rows)
+    summary = df.groupby("estimator")["pehe"].agg(["mean", "std"]).reset_index()
+    summary.to_csv(out / "table4_baselines.csv", index=False)
+    df.to_csv(out / "table4_baselines_raw.csv", index=False)
+    print("--- Table 4 Baselines ---")
+    print(summary.to_string(index=False))
 
-    for seed in range(5):
-        cfg = SyntheticConfig(n=2000, p=12, seed=seed + 99, regime="C", signal=1.0)
-        d, _ = generate_synthetic(cfg, norm_constants=norm)
-        X, T, Y, tau = d["X"], d["T"], d["Y"], d["tau"]
-        tr, te = np.asarray(d["train_idx"]), np.asarray(d["test_idx"])
-
-        tl = fit_t_learner(X[tr], T[tr], Y[tr], X[te], seed)
-        dr = fit_dr_learner(X[tr], T[tr], Y[tr], X[te], seed)
-
-        rows.append({
-            "seed": seed,
-            "zero_effect": rms(tau[te], 0.0),
-            "constant_oracle_ate": rms(tau[te], float(tau[tr].mean())),
-            "t_learner_gbm_n1400": rms(tau[te], tl),
-            "dr_learner_gbm_n1400": rms(tau[te], dr),
-        })
-
-        if args.run_budget_matched:
-            for m in budgets:
-                if m >= len(tr):
-                    sel = tr
-                else:
-                    # Deterministic subset selection
-                    tag_crc = zlib.crc32(b"factual_target_only") & 0xFFFFFFFF
-                    rng_m = np.random.default_rng(seed * 10007 + m * 17 + (tag_crc % 89))
-                    sel = rng_m.choice(tr, size=m, replace=False)
-                # Ensure both treatment arms have at least 3 units
-                if np.sum(T[sel] == 0) < 3 or np.sum(T[sel] == 1) < 3:
-                    continue
-                tl_m = fit_t_learner(X[sel], T[sel], Y[sel], X[te], seed)
-                xl_m = fit_x_learner(X[sel], T[sel], Y[sel], X[te], seed)
-                dr_m = fit_dr_learner(X[sel], T[sel], Y[sel], X[te], seed)
-                budget_rows.append({
-                    "seed": seed,
-                    "m": m,
-                    "t_learner_pehe": rms(tau[te], tl_m),
-                    "x_learner_pehe": rms(tau[te], xl_m),
-                    "dr_learner_pehe": rms(tau[te], dr_m),
-                })
-
-    df = pd.DataFrame(rows)
-    df.to_csv(out_dir / "table4_baselines_raw.csv", index=False)
-
-    summary = pd.DataFrame({
-        "predictor": ["zero_effect", "constant_oracle_ate", "t_learner_gbm_n1400", "dr_learner_gbm_n1400"],
-        "pehe_mean": [df[c].mean() for c in ["zero_effect", "constant_oracle_ate", "t_learner_gbm_n1400", "dr_learner_gbm_n1400"]],
-        "pehe_std": [df[c].std(ddof=1) for c in ["zero_effect", "constant_oracle_ate", "t_learner_gbm_n1400", "dr_learner_gbm_n1400"]],
-    })
-    summary.to_csv(out_dir / "table4_baselines.csv", index=False)
-
-    print("=== Table 4 Reference Predictors (5 seeds, sample std ddof=1) ===")
-    print(summary.to_string(index=False, float_format=lambda x: f"{x:.3f}"))
-
-    if args.run_budget_matched and budget_rows:
-        bdf = pd.DataFrame(budget_rows)
-        bsum = bdf.groupby("m")[["t_learner_pehe", "x_learner_pehe", "dr_learner_pehe"]].agg(["mean", "std"])
-        bsum.columns = ["_".join(c) for c in bsum.columns]
-        bsum = bsum.reset_index()
-        bsum.to_csv(out_dir / "table4_budget_matched_factual.csv", index=False)
-        print("\n=== Budget-Matched Target-Only Factual Learners ===")
-        print(bsum.to_string(index=False, float_format=lambda x: f"{x:.3f}"))
+    if args.run_budget_matched:
+        brows = []
+        for m in [20, 50, 100, 200, 400, 1400]:
+            for s in range(args.n_seeds):
+                brows.append(run_budget(s, m))
+        bdf = pd.DataFrame(brows)
+        bsum = bdf.groupby("m")["pehe"].agg(["mean", "std"]).reset_index()
+        bsum.to_csv(out / "table4_budget_matched_factual.csv", index=False)
+        print("\n--- Table 7 Budget-Matched T-Learner ---")
+        print(bsum.to_string(index=False))
 
 
 if __name__ == "__main__":

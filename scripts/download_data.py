@@ -1,11 +1,10 @@
-"""Download or verify external benchmark datasets (IHDP-100 replications)."""
+"""Download or verify external benchmark datasets.
+
+IHDP: auto-download from fredjo.com
+ACIC 2016: NOT auto-hosted here — place official files under data/acic2016/
+         expected: x.csv and zymu_1.csv ... zymu_10.csv
+"""
 from __future__ import annotations
-import sys as _sys, pathlib as _pl
-_ROOT = _pl.Path(__file__).resolve().parent.parent
-if str(_ROOT) not in _sys.path: _sys.path.insert(0, str(_ROOT))
-if str(_ROOT / 'src') not in _sys.path: _sys.path.insert(0, str(_ROOT / 'src'))
-
-
 import argparse
 import urllib.request
 from pathlib import Path
@@ -18,7 +17,6 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_dir", default="data")
     args = ap.parse_args()
-
     data_dir = Path(args.data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -35,7 +33,21 @@ def main() -> None:
             urllib.request.urlretrieve(url, dest)
             print(f"[DONE] Saved {dest}")
         except Exception as exc:
-            print(f"[WARN] Could not auto-download {fname} ({exc}). Please copy {fname} into {data_dir}/.")
+            print(f"[WARN] Could not auto-download {fname} ({exc}).")
+
+    acic = data_dir / "acic2016"
+    xcsv = acic / "x.csv"
+    if xcsv.exists():
+        n_zymu = len(list(acic.glob("zymu_*.csv")))
+        print(f"[OK] ACIC 2016 found at {acic} ({n_zymu} zymu files)")
+    else:
+        print(
+            f"[INFO] ACIC 2016 not found at {acic}.\n"
+            "  Place official ACIC 2016 files there:\n"
+            "    data/acic2016/x.csv\n"
+            "    data/acic2016/zymu_1.csv ... zymu_10.csv\n"
+            "  (Not redistributed by this script.)"
+        )
 
 
 if __name__ == "__main__":

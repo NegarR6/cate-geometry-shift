@@ -1,4 +1,4 @@
-"""Plot SYNTHETIC_SPEC_v1 PEHE curves for the paper figure."""
+"""Plot synthetic-spec PEHE curves for the paper figure."""
 
 from __future__ import annotations
 import sys as _sys, pathlib as _pl
@@ -71,6 +71,9 @@ def main():
     OUT.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(OUT, dpi=300, bbox_inches="tight")
     fig.savefig(OUT.with_suffix(".pdf"), bbox_inches="tight")
+    paper_out = ROOT / "figures" / "paper" / "fig_pehe_by_regime_signal.pdf"
+    paper_out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(paper_out, bbox_inches="tight")
     print(f"Saved {OUT}")
     print(f"Saved {OUT.with_suffix('.pdf')}")
 

@@ -10,7 +10,7 @@ Regimes:
   B — sparse threshold / tree-like
   C — smooth + interaction
 
-Do not change formulas without amending SYNTHETIC_SPEC_v1.md.
+Do not change formulas without amending synthetic-spec.md.
 """
 
 from __future__ import annotations
@@ -25,10 +25,10 @@ from typing import Dict, Literal, Tuple
 
 import numpy as np
 
-RegimeName = Literal["A", "B", "C"]
+RegimeName = Literal["A", "B", "C", "A2", "C2"]
 
 # ---------------------------------------------------------------------------
-# Locked constants (SYNTHETIC_SPEC_v1)
+# Locked constants (synthetic-spec)
 # ---------------------------------------------------------------------------
 N_DEFAULT = 3000
 P_DEFAULT = 12
@@ -97,10 +97,28 @@ def tau_tilde_C(X: np.ndarray) -> np.ndarray:
     return np.tanh(X[:, 0]) * X[:, 1] + 0.4 * (X[:, 2] ** 2) - 0.2 * X[:, 3]
 
 
+def tau_tilde_A2(X: np.ndarray) -> np.ndarray:
+    """Control: same smooth geometry class as A, different coefficients / variables.
+    Used for A->A' geometry-within-class shift experiments (P0 control).
+    """
+    return (
+        np.tanh(0.5 * X[:, 1] - 0.8 * X[:, 0])
+        + 0.4 * np.cos(X[:, 2])
+        - 0.3 * X[:, 4]
+    )
+
+
+def tau_tilde_C2(X: np.ndarray) -> np.ndarray:
+    """Control: same interaction geometry class as C, different coefficients."""
+    return np.tanh(X[:, 1]) * X[:, 0] + 0.3 * (X[:, 3] ** 2) - 0.25 * X[:, 2]
+
+
 TAU_FN = {
     "A": tau_tilde_A,
     "B": tau_tilde_B,
     "C": tau_tilde_C,
+    "A2": tau_tilde_A2,
+    "C2": tau_tilde_C2,
 }
 
 
@@ -120,7 +138,7 @@ def normalization_constant(regime: RegimeName, rng: np.random.Generator, p: int 
 def compute_all_norm_constants(p: int = P_DEFAULT, base_seed: int = 12345) -> Dict[str, float]:
     """Fixed constants shared across all experiment seeds."""
     rng = np.random.default_rng(base_seed)
-    return {r: normalization_constant(r, rng, p=p) for r in ("A", "B", "C")}  # type: ignore
+    return {r: normalization_constant(r, rng, p=p) for r in ("A", "B", "C", "A2", "C2")}  # type: ignore
 
 
 def tau(X: np.ndarray, regime: RegimeName, signal: float, norm: float) -> np.ndarray:
@@ -173,7 +191,7 @@ def generate_synthetic(
         "norm_constants": norm_constants,
         "n_train": int(n_tr),
         "n_test": int(cfg.n - n_tr),
-        "spec": "SYNTHETIC_SPEC_v1",
+        "spec": "synthetic-spec",
     }
     return data, meta
 
@@ -253,7 +271,7 @@ def generate_synthetic_hard(
 
 
 # ---------------------------------------------------------------------------
-# Geometry continuum (Attack Plan Phase 1) — additive blend of normalized τ
+# Geometry continuum (continuum phase) — additive blend of normalized τ
 # ---------------------------------------------------------------------------
 
 def tau_blend(

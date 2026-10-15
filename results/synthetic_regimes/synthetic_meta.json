@@ -1,0 +1,59 @@
+{
+  "spec": "synthetic-spec",
+  "norm_constants": {
+    "A": 1.3733875762414394,
+    "B": 1.566438334322391,
+    "C": 1.1564682851279287,
+    "A2": 1.4204560873205,
+    "C2": 1.2384971916731735
+  },
+  "regimes": [
+    "A",
+    "B",
+    "C"
+  ],
+  "signals": [
+    0.5,
+    1.0,
+    2.0
+  ],
+  "seeds": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9
+  ],
+  "models": [
+    "ripo_no_tree",
+    "ft_tarnet",
+    "xlearner",
+    "causalforest"
+  ],
+  "n": 3000,
+  "p": 12,
+  "epochs": 80,
+  "patience": 15,
+  "early_stopping": "validation_20pct",
+  "ipm_weight": 0.1,
+  "ipm_type": "mean_diff",
+  "neural_hparams": {
+    "d_token": 32,
+    "num_layers": 3,
+    "nhead": 4,
+    "dim_feedforward": 64,
+    "dropout": 0.1,
+    "head_hidden_dim": 64,
+    "lr": 0.001,
+    "weight_decay": 1e-05,
+    "batch_size": 128
+  },
+  "continue_on_error": false,
+  "ripo_tree_path": "None (pure FT)",
+  "elapsed_sec": 1696.8290011882782
+}

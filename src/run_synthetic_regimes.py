@@ -1,5 +1,5 @@
 """
-Run SYNTHETIC_SPEC_v1 experiment.
+Run synthetic-spec experiment.
 
 Usage:
   python -m src.run_synthetic_regimes --regimes A,B,C --signals 0.5,1.0,2.0 --seeds 0-9
@@ -564,7 +564,7 @@ def main():
         print("Wilcoxon failed:", e)
 
     meta_out = {
-        "spec": "SYNTHETIC_SPEC_v1",
+        "spec": "synthetic-spec",
         "norm_constants": norm_constants,
         "regimes": regimes,
         "signals": signals,

@@ -5,7 +5,7 @@ if str(_ROOT / 'src') not in _sys.path: _sys.path.insert(0, str(_ROOT / 'src'))
 """
 Neural Network Models for Causal Inference
 FT-Transformer + TARNet Architecture
-Following: "FT-Transformer: Feature Tokenizer Transformer for Tabular Data" (ICLR 2022)
+Following: "FT-Transformer: Feature Tokenizer Transformer for Tabular Data" (NeurIPS 2021)
 """
 
 import torch

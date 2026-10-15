@@ -294,7 +294,7 @@ class NeuralTrainer:
         if log_to_wandb:
             if not WANDB_AVAILABLE:
                 raise ImportError('wandb is not installed but log_to_wandb=True was requested')
-            wandb.init(project="iclr2027-neural-baseline", name=run_name)
+            wandb.init(project="cate-geometry-shift", name=run_name)
         
         best_val_loss = float('inf')
         patience_counter = 0

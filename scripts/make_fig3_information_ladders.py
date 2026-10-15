@@ -26,7 +26,7 @@ plt.rcParams.update({
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--syn_csv", default="results/table5_synthetic_ladder_summary.csv")
+    ap.add_argument("--syn_csv", default="results/budgeted_ladder/budgeted_ladder_summary.csv")
     ap.add_argument("--ihdp_csv", default="results/table6_ihdp_x_ladder_summary.csv")
     ap.add_argument("--out", default="figures/paper/fig_information_ladders.pdf")
     args = ap.parse_args()
@@ -54,8 +54,8 @@ def main() -> None:
             fmt=fmt, color=color, capsize=3, label=label, linewidth=1.8, markersize=6
         )
     ax1.axhline(frozen_syn, color="#555555", linestyle="--", linewidth=1.4, label=f"Frozen mixture ({frozen_syn:.2f})")
-    ax1.axhline(1.006, color="#8c564b", linestyle=":", linewidth=1.4, label="Constant ATE (oracle, 1.01)")
-    ax1.axhline(0.471, color="#9467bd", linestyle="-.", linewidth=1.4, label="Target T-learner (n=1400, 0.47)")
+    ax1.axhline(1.010, color="#8c564b", linestyle=":", linewidth=1.4, label="Constant ATE (oracle, 1.01)")
+    ax1.axhline(0.544, color="#9467bd", linestyle="-.", linewidth=1.4, label="Target T-learner (n=1400, 0.54)")
     ax1.set_title("Synthetic geometry shift $\\{A, B\\} \\to C$")
     ax1.set_xlabel("Target supervision budget $m$")
     ax1.set_ylabel("Target root PEHE")

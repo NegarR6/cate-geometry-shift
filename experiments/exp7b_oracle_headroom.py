@@ -1,7 +1,7 @@
 """
 E1 — Oracle gap for synthetic regimes (see E1_ORACLE_GAP_SPEC.md).
 
-Re-fits models on the locked SYNTHETIC_SPEC_v1 DGPs, stores test τ̂ for all
+Re-fits models on the locked synthetic-spec DGPs, stores test τ̂ for all
 models, and computes pointwise-oracle PEHE vs fixed estimators.
 
 Smoke:
@@ -271,7 +271,7 @@ def main():
 
     meta_out = {
         "spec": "E1_ORACLE_GAP_SPEC",
-        "parent_spec": "SYNTHETIC_SPEC_v1",
+        "parent_spec": "synthetic-spec",
         "norm_constants": norm_constants,
         "regimes": regimes,
         "signals": signals,

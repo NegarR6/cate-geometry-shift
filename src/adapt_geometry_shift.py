@@ -1,22 +1,26 @@
 """
-Geometry-Shift Adaptation — STRONG VERSION
+Geometry-Shift Adaptation — P0 fixed version.
 
-Two modes of capacity:
-  router_only   : freeze experts, fine-tune router (previous; small gains)
-  full_adapt    : fine-tune router + both experts with lower LR on k samples
-                  using factual MSE + (optional) oracle routing + direct τ loss
-
-The full_adapt mode is what can break the Tree-only ceiling under shift,
-because the NeuralExpert can re-specialise to the target geometry from
-the k samples.
+P0 FIXES:
+- Fixed number of gradient updates (n_updates) independent of m, so the
+  "m curve" is not confounded with optimization budget.
+- Entropy maximisation term is documented and OFF by default
+  (entropy_weight=0.0); previous code always maximised router entropy.
+- Simple label baselines (ridge/GBR/kNN on the same labels) can be run
+  side-by-side for fair comparison.
+- Propensity passed to the model should be estimated (ê), not oracle e
+  from the DGP; callers are responsible for supplying ê.
 """
-
 from __future__ import annotations
-import sys as _sys, pathlib as _pl
-_ROOT = _pl.Path(__file__).resolve().parent.parent
-if str(_ROOT) not in _sys.path: _sys.path.insert(0, str(_ROOT))
-if str(_ROOT / 'src') not in _sys.path: _sys.path.insert(0, str(_ROOT / 'src'))
 
+import sys as _sys
+import pathlib as _pl
+
+_ROOT = _pl.Path(__file__).resolve().parent.parent
+if str(_ROOT) not in _sys.path:
+    _sys.path.insert(0, str(_ROOT))
+if str(_ROOT / "src") not in _sys.path:
+    _sys.path.insert(0, str(_ROOT / "src"))
 
 from typing import Any, Dict, Optional, Tuple
 
@@ -81,6 +85,7 @@ def build_fewshot_oracle(
     tau_k: np.ndarray,
     device: str,
 ) -> np.ndarray:
+    """Binary indicator: 1 if tree expert is closer to tau than neural expert."""
     tau_n, tau_t = _expert_preds(model, X_k, e_k, tree_k, device)
     err_n = np.abs(tau_n - tau_k)
     err_t = np.abs(tau_t - tau_k)
@@ -100,11 +105,8 @@ def compute_dr_pseudo_outcomes(
     e_clip: float = 0.05,
 ) -> np.ndarray:
     """
-    Doubly-robust CATE pseudo-outcome using the *current* model as nuisance:
-
-      φ = (μ1−μ0) + T(Y−μ1)/ê − (1−T)(Y−μ0)/(1−ê)
-
-    No ground-truth τ is used. Suitable as a τ-free supervision target on k samples.
+    Doubly-robust CATE pseudo-outcome using the *current* model as nuisance.
+    No ground-truth τ is used.
     """
     model.eval()
     n = len(X)
@@ -142,28 +144,36 @@ def adapt_fewshot(
     tau_k: Optional[np.ndarray] = None,
     mode: str = "full_adapt",
     device: str = "cpu",
-    steps: int = 150,
+    n_updates: int = 200,
     lr_router: float = 1e-3,
     lr_expert: float = 3e-4,
     batch_size: int = 32,
-    entropy_weight: float = 0.01,
+    entropy_weight: float = 0.0,
     route_weight: float = 0.5,
     factual_weight: float = 1.0,
     tau_weight: float = 1.0,
     ipm_weight: float = 0.05,
-    refresh_oracle_every: int = 25,
+    refresh_oracle_every: int = 50,
     verbose: bool = False,
+    grad_clip: float = 1.0,
+    seed: int = 0,
+    # legacy alias
+    steps: Optional[int] = None,
 ) -> GeometryAdaptiveCATE:
     """
-    Strong few-shot adaptation.
+    Few-shot adaptation with FIXED gradient budget.
 
-    mode
-      router_only     : freeze experts; only router + optional route CE
-      full_adapt      : unfreeze experts; factual + true τ loss + route CE
-      supervised_factual : unfreeze; factual only (real-data friendly)
-      unsupervised_tta   : no labels; entropy + agreement
-      dr_adapt        : unfreeze; factual + DR pseudo-outcome loss (τ-free)
+    n_updates is the number of optimizer steps and does NOT grow with m.
+    Sampling is with replacement from the m points so that small-m and
+    large-m arms receive the same optimisation budget.
+
+    entropy_weight defaults to 0.0 (previous code maximised entropy, which
+    was undocumented). Set >0 only if you intentionally want that regulariser.
     """
+    if steps is not None:
+        # backward-compat: honour old `steps` kwarg but prefer n_updates
+        n_updates = steps
+
     model = copy.deepcopy(model).to(device)
 
     freeze = mode == "router_only"
@@ -186,11 +196,14 @@ def adapt_fewshot(
         ]
 
     opt = optim.AdamW(params, weight_decay=1e-5)
-    sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(steps, 1))
+    sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(n_updates, 1))
     causal = CausalLoss(ipm_weight=ipm_weight, ipm_type="mean_diff")
 
     n = len(X_k)
-    # DR mode: build pseudo τ from observables only (no ground-truth τ in loss)
+    if n == 0:
+        return model
+
+    # DR mode: build pseudo τ from observables only
     if mode == "dr_adapt":
         tau_k = compute_dr_pseudo_outcomes(
             model, X_k, T_k, Y_k, e_k, tree_k, device
@@ -203,37 +216,29 @@ def adapt_fewshot(
     if use_oracle:
         oracle_np = build_fewshot_oracle(model, X_k, e_k, tree_k, tau_k, device)
 
-    def _make_loader(oracle_arr: Optional[np.ndarray], tau_arr: Optional[np.ndarray]) -> DataLoader:
-        ts = (
-            torch.as_tensor(tree_k, dtype=torch.float32)
-            if tree_k is not None
-            else torch.zeros(n, 0)
-        )
-        oc = (
-            torch.as_tensor(oracle_arr, dtype=torch.long)
-            if oracle_arr is not None
-            else torch.full((n,), -1, dtype=torch.long)
-        )
-        tau_t = (
-            torch.as_tensor(tau_arr, dtype=torch.float32)
-            if tau_arr is not None
-            else torch.zeros(n)
-        )
-        ds = TensorDataset(
-            torch.as_tensor(X_k, dtype=torch.float32),
-            torch.as_tensor(T_k, dtype=torch.float32),
-            torch.as_tensor(Y_k, dtype=torch.float32),
-            torch.as_tensor(e_k, dtype=torch.float32),
-            ts,
-            oc,
-            tau_t,
-        )
-        return DataLoader(ds, batch_size=min(batch_size, max(n, 1)), shuffle=True)
+    # Pre-build tensors once
+    X_t = torch.as_tensor(X_k, dtype=torch.float32)
+    T_t = torch.as_tensor(T_k, dtype=torch.float32)
+    Y_t = torch.as_tensor(Y_k, dtype=torch.float32)
+    e_t = torch.as_tensor(e_k, dtype=torch.float32)
+    if tree_k is not None:
+        tree_t = torch.as_tensor(tree_k, dtype=torch.float32)
+    else:
+        tree_t = torch.zeros(n, 0)
+    if oracle_np is not None:
+        oc_t = torch.as_tensor(oracle_np, dtype=torch.long)
+    else:
+        oc_t = torch.full((n,), -1, dtype=torch.long)
+    if tau_k is not None:
+        tau_t = torch.as_tensor(tau_k, dtype=torch.float32)
+    else:
+        tau_t = torch.zeros(n)
 
-    loader = _make_loader(oracle_np, tau_k)
+    bs = min(batch_size, n)
+    gen = torch.Generator().manual_seed(int(seed))  # cell-level reproducible sampling
 
-    for step in range(1, steps + 1):
-        # Periodically refresh oracle / DR targets as experts improve
+    for step in range(1, n_updates + 1):
+        # Refresh oracle / DR targets periodically
         if (
             use_oracle
             and refresh_oracle_every > 0
@@ -244,87 +249,92 @@ def adapt_fewshot(
                 tau_k = compute_dr_pseudo_outcomes(
                     model, X_k, T_k, Y_k, e_k, tree_k, device
                 )
+                tau_t = torch.as_tensor(tau_k, dtype=torch.float32)
             oracle_np = build_fewshot_oracle(model, X_k, e_k, tree_k, tau_k, device)
-            loader = _make_loader(oracle_np, tau_k)
+            oc_t = torch.as_tensor(oracle_np, dtype=torch.long)
 
         model.train()
         if freeze:
             model.neural_expert.eval()
             model.tree_expert.eval()
 
-        total_loss = 0.0
-        n_seen = 0
-        for batch in loader:
-            x, w, y, e, tree_sig, oc_b, tau_b = [t.to(device) for t in batch]
-            tree_sig = (
-                tree_sig if tree_sig.numel() > 0 and tree_sig.size(-1) > 0 else None
-            )
+        # Sample a batch with replacement (fixed budget independent of m)
+        idx = torch.randint(0, n, (bs,), generator=gen)
+        x = X_t[idx].to(device)
+        w = T_t[idx].to(device)
+        y = Y_t[idx].to(device)
+        e = e_t[idx].to(device)
+        tree_sig = tree_t[idx].to(device)
+        oc_b = oc_t[idx].to(device)
+        tau_b = tau_t[idx].to(device)
+        tree_sig = (
+            tree_sig if tree_sig.numel() > 0 and tree_sig.size(-1) > 0 else None
+        )
 
-            opt.zero_grad(set_to_none=True)
-            out = model(x, e, tree_signals=tree_sig)
-            loss = x.new_tensor(0.0)
+        opt.zero_grad(set_to_none=True)
+        out = model(x, e, tree_signals=tree_sig)
+        loss = x.new_tensor(0.0)
 
-            if mode == "router_only":
-                mask = oc_b >= 0
-                if mask.any():
-                    log_p = F.log_softmax(out["logits"][mask], dim=-1)
-                    loss = loss + route_weight * F.nll_loss(log_p, oc_b[mask])
+        if mode == "router_only":
+            mask = oc_b >= 0
+            if mask.any():
+                log_p = F.log_softmax(out["logits"][mask], dim=-1)
+                loss = loss + route_weight * F.nll_loss(log_p, oc_b[mask])
 
-            elif mode in ("full_adapt", "dr_adapt"):
-                # 1) factual + light IPM
-                c_loss, _, _ = causal(out["y0"], out["y1"], y, w, out["z"])
-                loss = loss + factual_weight * c_loss
-                # 2) τ or DR-pseudo supervision
-                if use_tau:
-                    loss = loss + tau_weight * F.mse_loss(out["tau"], tau_b)
-                    loss = loss + 0.5 * tau_weight * (
-                        F.mse_loss(out["tau_n"], tau_b)
-                        + F.mse_loss(out["tau_t"], tau_b)
-                    )
-                # 3) routing CE toward better expert under the same target
-                mask = oc_b >= 0
-                if mask.any():
-                    log_p = F.log_softmax(out["logits"][mask], dim=-1)
-                    loss = loss + route_weight * F.nll_loss(log_p, oc_b[mask])
+        elif mode in ("full_adapt", "dr_adapt"):
+            c_loss, _, _ = causal(out["y0"], out["y1"], y, w, out["z"])
+            loss = loss + factual_weight * c_loss
+            if use_tau:
+                loss = loss + tau_weight * F.mse_loss(out["tau"], tau_b)
+                loss = loss + 0.5 * tau_weight * (
+                    F.mse_loss(out["tau_n"], tau_b)
+                    + F.mse_loss(out["tau_t"], tau_b)
+                )
+            mask = oc_b >= 0
+            if mask.any():
+                log_p = F.log_softmax(out["logits"][mask], dim=-1)
+                loss = loss + route_weight * F.nll_loss(log_p, oc_b[mask])
 
-            elif mode == "supervised_factual":
-                c_loss, _, _ = causal(out["y0"], out["y1"], y, w, out["z"])
-                loss = loss + c_loss
+        elif mode == "supervised_factual":
+            c_loss, _, _ = causal(out["y0"], out["y1"], y, w, out["z"])
+            loss = loss + c_loss
 
-            elif mode == "unsupervised_tta":
-                wts = out["weights"]
-                ent = -(wts.clamp(1e-8) * wts.clamp(1e-8).log()).sum(-1).mean()
-                tau_tgt = 0.5 * (out["tau_n"].detach() + out["tau_t"].detach())
-                agree = F.mse_loss(out["tau"], tau_tgt)
-                loss = loss + agree + entropy_weight * ent
-            else:
-                raise ValueError(f"Unknown mode {mode}")
+        elif mode == "unsupervised_tta":
+            wts = out["weights"]
+            ent = -(wts.clamp(1e-8) * wts.clamp(1e-8).log()).sum(-1).mean()
+            tau_tgt = 0.5 * (out["tau_n"].detach() + out["tau_t"].detach())
+            agree = F.mse_loss(out["tau"], tau_tgt)
+            loss = loss + agree
+            if entropy_weight != 0.0:
+                # Note: original code maximised entropy (negative weight).
+                # We keep the same convention only when entropy_weight > 0.
+                loss = loss - entropy_weight * ent
+        else:
+            raise ValueError(f"Unknown adaptation mode: {mode}")
 
-            if mode != "unsupervised_tta" and entropy_weight > 0:
-                wts = out["weights"]
-                ent = -(wts.clamp(1e-8) * wts.clamp(1e-8).log()).sum(-1).mean()
-                loss = loss - 0.5 * entropy_weight * ent
+        # Optional entropy regulariser (default off)
+        if entropy_weight != 0.0 and mode != "unsupervised_tta":
+            wts = out["weights"]
+            ent = -(wts.clamp(1e-8) * wts.clamp(1e-8).log()).sum(-1).mean()
+            loss = loss - entropy_weight * ent
 
-            loss.backward()
+        loss.backward()
+        if grad_clip and grad_clip > 0:
             nn.utils.clip_grad_norm_(
-                [p for p in model.parameters() if p.requires_grad], 1.0
+                [q for q in model.parameters() if q.requires_grad], grad_clip
             )
-            opt.step()
-            total_loss += float(loss.detach()) * x.size(0)
-            n_seen += x.size(0)
-
+        opt.step()
         sched.step()
-        if verbose and (step % 25 == 0 or step == 1):
-            print(
-                f"  [adapt {mode}] step={step:03d} loss={total_loss / max(n_seen, 1):.4f}"
-            )
+
+        if verbose and (step % 50 == 0 or step == n_updates):
+            print(f"  adapt step {step}/{n_updates}  loss={float(loss):.4f}")
 
     model.eval()
     return model
 
 
-# backward-compatible alias
 def adapt_router_fewshot(*args, **kwargs):
+    """Backward-compatible wrapper."""
     if "freeze_experts" in kwargs:
         fe = kwargs.pop("freeze_experts")
         if fe and "mode" not in kwargs:
@@ -347,18 +357,21 @@ def evaluate_shift_with_adaptation(
     *,
     k: int = 100,
     adapt_mode: str = "full_adapt",
-    adapt_steps: int = 150,
+    n_updates: int = 200,
     seed: int = 0,
     device: str = "cpu",
     verbose: bool = False,
+    # legacy
+    adapt_steps: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Split target into k adaptation + held-out test.
     Compare PEHE before vs after strong adaptation.
     """
-    # map legacy name
     if adapt_mode == "supervised_oracle":
         adapt_mode = "full_adapt"
+    if adapt_steps is not None:
+        n_updates = adapt_steps
 
     rng = np.random.default_rng(seed)
     n = len(X_te)
@@ -399,7 +412,7 @@ def evaluate_shift_with_adaptation(
         tau_k=tau_te[adapt_idx],
         mode=adapt_mode,
         device=device,
-        steps=adapt_steps,
+        n_updates=n_updates,
         verbose=verbose,
     )
 
@@ -423,4 +436,5 @@ def evaluate_shift_with_adaptation(
         "w_neural_before": float(w0[:, 0].mean()),
         "w_neural_after": float(w1[:, 0].mean()),
         "delta_pehe": pehe_before - pehe_after,
+        "n_updates": n_updates,
     }

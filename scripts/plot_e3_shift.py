@@ -54,7 +54,7 @@ def main(csv_path: Path, outdir: Path) -> None:
     ax.set_xticklabels([str(s) for s in signals])
     ax.set_xlabel("Signal s")
     ax.set_ylabel(r"$\Delta_{\mathrm{tgt}}$ (global $-$ router)")
-    ax.set_title("Shift: router vs target global (negative = fail)")
+    ax.set_title("Cross-regime shift: router vs. target global")
     ax.legend(fontsize=8, ncol=2)
 
     # --- Right: in-distribution control delta_src_id ---
@@ -77,7 +77,8 @@ def main(csv_path: Path, outdir: Path) -> None:
         ax.axhline(0.0, color="k", lw=0.8, ls="--")
         ax.set_xlabel("Signal s")
         ax.set_ylabel(r"$\Delta_{\mathrm{src\,ID}}$")
-        ax.set_title("In-distribution control (should match E2)")
+        ax.set_xticks(sorted(ctrl["signal"].unique()))
+        ax.set_title("In-distribution control (source regime)")
         ax.legend(fontsize=8)
     else:
         ax.text(0.5, 0.5, "no delta_src_id_mean column", ha="center")

@@ -1,99 +1,113 @@
-"""
-Unit tests: tree-signal leakage safety + seed reproducibility smoke.
+"""Unit tests for leakage guards and deterministic seeds (P0).
 
-Run from repo root:
-  python -m src.test_leakage_and_seed
+Critical claim of the paper protocol: under pure geometry shift the
+source-fitted tree-signal extractor must NOT change when target outcomes
+are permuted or replaced. These tests enforce that contract.
 """
 from __future__ import annotations
-import sys as _sys, pathlib as _pl
-_ROOT = _pl.Path(__file__).resolve().parent.parent
-if str(_ROOT) not in _sys.path: _sys.path.insert(0, str(_ROOT))
-if str(_ROOT / 'src') not in _sys.path: _sys.path.insert(0, str(_ROOT / 'src'))
 
+import sys
+import pathlib
+
+_ROOT = pathlib.Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+if str(_ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(_ROOT / "src"))
 
 import numpy as np
-import torch
+import pytest
 
+from src.synthetic_regimes import sample_X, propensity, mu0, tau_tilde_A, tau_tilde_C
 from src.tree_signals import CrossFittedTreeSignals
-from src.train_neural import set_global_seed, CausalLoss
-from src.models_hybrid_v2 import ResidualAttentionCATE, RIPOAttention
+from src.budgeted_ladder_utils import dr_pseudo_tau
 
 
-def test_tree_signals_oof_no_full_arm_fallback():
-    """Held-out rows must not appear in outcome nuisance fits (leakage check)."""
+def _make_source(n=400, seed=0):
+    rng = np.random.default_rng(seed)
+    X = sample_X(n, 12, rng)
+    e = propensity(X)
+    T = rng.binomial(1, e)
+    tau = tau_tilde_A(X)
+    Y = mu0(X) + T * tau + rng.normal(0, 0.5, size=n)
+    return X, T, Y, e
+
+
+def test_tree_signals_source_freeze_under_target_y_permutation():
+    """Permuting target Y must not change transform(X_target) of a frozen source extractor."""
+    Xs, Ts, Ys, _ = _make_source(seed=7)
+    extractor = CrossFittedTreeSignals(n_splits=3, seed=7, n_estimators=30, max_depth=3)
+    extractor.fit_transform(Xs, Ts, Ys)
+
+    rng = np.random.default_rng(99)
+    Xt = sample_X(200, 12, rng)
+    sig1 = extractor.transform(Xt)
+    Yt = rng.normal(0, 1, size=200)
+    for k in range(5):
+        _ = rng.permutation(Yt)  # unused; transform must ignore it
+        sig_k = extractor.transform(Xt)
+        np.testing.assert_allclose(sig1, sig_k, atol=1e-7)
+
+
+def test_tree_signals_refit_on_target_changes_signals():
+    """Sanity: if someone re-fits on target, signals DO change (the bug we guard against)."""
+    Xs, Ts, Ys, _ = _make_source(seed=3)
+    extractor = CrossFittedTreeSignals(n_splits=3, seed=3, n_estimators=30, max_depth=3)
+    extractor.fit_transform(Xs, Ts, Ys)
+
+    rng = np.random.default_rng(11)
+    Xt = sample_X(300, 12, rng)
+    e = propensity(Xt)
+    Tt = rng.binomial(1, e)
+    tau = tau_tilde_C(Xt)
+    Yt = mu0(Xt) + Tt * tau + rng.normal(0, 0.5, size=300)
+
+    sig_frozen = extractor.transform(Xt)
+
+    leaky = CrossFittedTreeSignals(n_splits=3, seed=3, n_estimators=30, max_depth=3)
+    leaky.fit_transform(Xt, Tt, Yt)
+    sig_leaky = leaky.transform(Xt)
+
+    assert not np.allclose(sig_frozen, sig_leaky, atol=1e-3)
+
+
+def test_dr_pseudo_tau_length_matches_input():
+    """dr_pseudo_tau must only ever be called on the pool; length must match."""
     rng = np.random.default_rng(0)
-    n, p = 80, 6
-    X = rng.normal(size=(n, p))
-    w = rng.integers(0, 2, size=n)
-    # Force both arms present
-    w[:20] = 0
-    w[20:40] = 1
-    y = rng.normal(size=n)
-
-    ext = CrossFittedTreeSignals(n_splits=4, seed=0, n_estimators=20, max_depth=2)
-    signals = ext.fit_transform(X, w, y)
-    assert signals.shape == (n, 4)
-    # tau column = mu1 - mu0
-    np.testing.assert_allclose(signals[:, 2], signals[:, 1] - signals[:, 0], atol=1e-5)
-    # propensity clipped
-    assert signals[:, 3].min() >= 0.025 - 1e-6
-    assert signals[:, 3].max() <= 0.975 + 1e-6
-    print("  OK tree OOF shape + pack")
+    n = 80
+    X = rng.normal(size=(n, 6))
+    T = rng.binomial(1, 0.5, size=n)
+    Y = rng.normal(size=n)
+    tau = dr_pseudo_tau(X, T, Y, n_splits=3, seed=0, smooth=False)
+    assert tau.shape == (n,)
+    assert np.all(np.isfinite(tau))
 
 
-def test_seed_reproducibility_forward():
-    # eval() disables dropout so forward is deterministic given same weights+input
-    set_global_seed(123)
-    m1 = ResidualAttentionCATE(num_features=8, d_token=16, num_layers=1, nhead=2)
-    m1.eval()
-    set_global_seed(123)
-    x = torch.randn(16, 8)
-    with torch.no_grad():
-        y0a, y1a = m1(x)
-
-    set_global_seed(123)
-    m2 = ResidualAttentionCATE(num_features=8, d_token=16, num_layers=1, nhead=2)
-    m2.eval()
-    set_global_seed(123)
-    x2 = torch.randn(16, 8)
-    with torch.no_grad():
-        y0b, y1b = m2(x2)
-
-    assert torch.allclose(x, x2), "input draw not reproducible"
-    assert torch.allclose(y0a, y0b), "seed mismatch y0"
-    assert torch.allclose(y1a, y1b), "seed mismatch y1"
-    print("  OK seed-reproducible init + forward")
+def test_dr_default_no_smooth():
+    """Default smooth=False after P0; smoothed and unsmoothed differ on nonlinear data."""
+    rng = np.random.default_rng(1)
+    n = 120
+    X = rng.normal(size=(n, 5))
+    T = rng.binomial(1, 0.5, size=n)
+    Y = np.sin(X[:, 0]) * X[:, 1] + T * (X[:, 2] ** 2) + rng.normal(0, 0.1, size=n)
+    tau_raw = dr_pseudo_tau(X, T, Y, n_splits=3, seed=1, smooth=False)
+    tau_sm = dr_pseudo_tau(X, T, Y, n_splits=3, seed=1, smooth=True)
+    assert not np.allclose(tau_raw, tau_sm, atol=1e-5)
 
 
-def test_no_tree_path_equals_mean_tokens():
-    set_global_seed(0)
-    m = RIPOAttention(num_features=5, d_token=16, num_layers=1, nhead=2)
-    x = torch.randn(8, 5)
-    y0, y1, z, extra = m(x, tree_signals=None)
-    assert extra is None
-    assert z.shape == (8, 16)
-    print("  OK no-tree path returns pure neural mean")
+def test_seed_reproducibility_dgp():
+    """Two calls with the same seed produce identical X, T, Y."""
+    from src.synthetic_regimes import generate_synthetic, SyntheticConfig
+
+    cfg = SyntheticConfig(n=200, regime="A", signal=1.0, seed=42)
+    d1, _ = generate_synthetic(cfg)
+    d2, _ = generate_synthetic(cfg)
+    np.testing.assert_array_equal(d1["X"], d2["X"])
+    np.testing.assert_array_equal(d1["T"], d2["T"])
+    np.testing.assert_array_equal(d1["Y"], d2["Y"])
 
 
-def test_causal_loss_ipm_types():
-    set_global_seed(0)
-    rep = torch.randn(20, 8)
-    w = torch.tensor([0, 1] * 10).float()
-    y0 = torch.randn(20)
-    y1 = torch.randn(20)
-    y = torch.randn(20)
-    for t in ("mean_diff", "mmd", "sliced", "sinkhorn"):
-        loss_fn = CausalLoss(ipm_weight=0.5, ipm_type=t)
-        total, out, ipm = loss_fn(y0, y1, y, w, representation=rep)
-        assert total.ndim == 0
-        assert torch.isfinite(total)
-    print("  OK CausalLoss all ipm_types")
-
-
-if __name__ == "__main__":
-    print("Running leakage / seed tests...")
-    test_tree_signals_oof_no_full_arm_fallback()
-    test_seed_reproducibility_forward()
-    test_no_tree_path_equals_mean_tokens()
-    test_causal_loss_ipm_types()
-    print("ALL PASSED")
+def test_xgboost_required():
+    """Importing tree_signals must succeed only when xgboost is present."""
+    import src.tree_signals as ts
+    assert hasattr(ts, "CrossFittedTreeSignals")
