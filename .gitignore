@@ -20,3 +20,5 @@ wandb/
 *.log
 *.tmp
 .DS_Store
+
+data/acic2016/

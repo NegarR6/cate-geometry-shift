@@ -4,10 +4,17 @@ Semi-synthetic geometry morphing — STRONG contrast version.
 Design goals for journal external validity:
   1) Real covariates (IHDP / ACIC-style arrays)
   2) Two τ geometries that *force* ranking / adaptation gap:
-       - smooth: low-frequency surface (kNN of base tau, then ridge-smooth)
+       - smooth: leave-one-out distance-weighted kNN of base tau, then ridge-smooth
+         (self-neighbour exclusion prevents identity reconstruction)
        - threshold: sharp multi-feature piecewise constant with LARGE level gap
-  3) Shared propensity / baseline mu0; only τ geometry changes
+  3) Shared propensity / baseline mu0 fitted on the full paired cohort;
+     only τ geometry changes (intentional design for pure effect-surface shift)
   4) Optional signal amplification so geometry dominates noise
+
+Note: full-cohort nuisance fitting and feature selection are intentional so that
+source and target worlds share identical P(X), e(x) and mu0(x).  The resulting
+benchmark is a controlled paired stress test, not an independent two-cohort
+external validation.  kNN smoothing uses strict leave-one-out predictions.
 """
 from __future__ import annotations
 import sys as _sys, pathlib as _pl
@@ -20,7 +27,6 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 from sklearn.linear_model import LogisticRegression, Ridge
-from sklearn.neighbors import KNeighborsRegressor
 from sklearn.tree import DecisionTreeRegressor
 
 
@@ -54,14 +60,30 @@ def _zscore(v: np.ndarray) -> np.ndarray:
 
 
 def smooth_tau(tau: np.ndarray, X: np.ndarray, k: int = 40) -> np.ndarray:
-    """Strong smooth geometry: kNN + Ridge projection (low-frequency)."""
+    """
+    Strong smooth geometry: leave-one-out distance-weighted kNN + Ridge projection.
+
+    Critical design choice: kNN predictions are strictly leave-one-out so that
+    no point uses itself as a neighbor (distance-0 self-reconstruction is forbidden).
+    This yields a genuine low-frequency surface rather than an identity map.
+    """
+    from sklearn.metrics import pairwise_distances
+
     X = np.asarray(X, dtype=np.float64)
-    tau = np.asarray(tau, dtype=np.float64)
-    k = int(min(max(15, k), max(10, len(tau) // 5)))
-    knn = KNeighborsRegressor(n_neighbors=k, weights="distance")
-    knn.fit(X, tau)
-    t1 = knn.predict(X)
-    # second smooth via ridge on coordinates + mild interactions of top PCs-like feats
+    tau = np.asarray(tau, dtype=np.float64).ravel()
+    n = len(tau)
+    k = int(min(max(15, k), max(10, n // 5)))
+    # LOO distances: set self-distance to +inf so a point never appears in its own
+    # neighbour set (prevents the identity contamination of in-sample kNN).
+    D = pairwise_distances(X, metric="euclidean")
+    np.fill_diagonal(D, np.inf)
+    nn_idx = np.argpartition(D, kth=k, axis=1)[:, :k]
+    rows = np.arange(n)[:, None]
+    d_nn = D[rows, nn_idx]
+    w = 1.0 / (d_nn + 1e-8)
+    w /= w.sum(axis=1, keepdims=True)
+    t1 = (w * tau[nn_idx]).sum(axis=1)
+    # second smooth via ridge on the LOO-kNN surface
     t2 = Ridge(alpha=5.0).fit(X, t1).predict(X)
     return _zscore(0.5 * t1 + 0.5 * t2).astype(np.float32)
 

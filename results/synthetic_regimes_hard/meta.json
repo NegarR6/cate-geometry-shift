@@ -1,0 +1,30 @@
+{
+  "spec": "SYNTHETIC_HARD_v1",
+  "n": 5000,
+  "p": 50,
+  "noise_std": 1.0,
+  "regimes": [
+    "A",
+    "B",
+    "C"
+  ],
+  "signals": [
+    0.5,
+    1.0,
+    2.0
+  ],
+  "seeds": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9
+  ],
+  "elapsed_sec": 18436.05491757393,
+  "note": "Appendix stress-test only. Do not replace SPEC v1 tables."
+}

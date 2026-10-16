@@ -1,0 +1,42 @@
+{
+  "spec": "SURROGATE_SELECTION_GEOMETRY_v1",
+  "regimes": [
+    "A",
+    "B",
+    "C"
+  ],
+  "signals": [
+    0.5,
+    1.0,
+    2.0
+  ],
+  "seeds": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9
+  ],
+  "epochs": 80,
+  "elapsed_sec": 3837.644475221634,
+  "norm_constants": {
+    "A": 1.3733875762414394,
+    "B": 1.566438334322391,
+    "C": 1.1564682851279287,
+    "A2": 1.4204560873205,
+    "C2": 1.2384971916731735
+  },
+  "surrogates": [
+    "S0_random",
+    "S1_factual_mse",
+    "S2_neg_tau_var",
+    "S3_ipw",
+    "S4_pseudo_dr",
+    "S5_policy"
+  ]
+}
